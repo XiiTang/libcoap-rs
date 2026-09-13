@@ -78,7 +78,7 @@ static COAP_STARTUP_ONCE: Once = Once::new();
 
 #[inline(always)]
 pub(crate) fn ensure_coap_started() {
-    COAP_STARTUP_ONCE.call_once(coap_startup_with_feature_checks);
+    COAP_STARTUP_ONCE.call_once(|| { coap_startup_with_feature_checks(); #[cfg(feature="runtime-io")] unsafe { libcoap_sys::coap_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG); libcoap_sys::coap_dtls_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG); } });
 }
 
 #[derive(Debug)]

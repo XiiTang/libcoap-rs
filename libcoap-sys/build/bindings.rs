@@ -129,6 +129,7 @@ pub fn generate_libcoap_bindings(
         .blocklist_type("in6?_(addr|port)(_t)?")
         .blocklist_type("in6_addr__bindgen_ty_1")
         .blocklist_type("(__)?socklen_t")
+        .blocklist_type("__darwin_socklen_t")
         .blocklist_type("fd_set")
         .blocklist_type("sa_family_t")
         .blocklist_type("(__)?time_t")

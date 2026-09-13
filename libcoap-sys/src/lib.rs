@@ -313,7 +313,7 @@
 
 use core::ffi::c_void;
 
-use c_stdlib::{epoll_event, fd_set, memcmp, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, socklen_t, time_t};
+use c_stdlib::{ fd_set, memcmp, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, socklen_t, time_t};
 /// Re-export of the crate that provides libc data types used by libcoap.
 ///
 /// In most cases, this will be libc, but on the ESP-IDF, it will be esp_idf_sys.
@@ -767,3 +767,9 @@ mod tests {
         server_thread_handle.join().expect("Error waiting for server thread");
     }
 }
+
+#[cfg(any(target_os="linux",target_os="android"))]
+use c_stdlib::epoll_event;
+#[cfg(not(any(target_os="linux",target_os="android")))]
+#[repr(C)]
+pub struct epoll_event { _opaque: [u8; 0] }

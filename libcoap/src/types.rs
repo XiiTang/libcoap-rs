@@ -140,6 +140,8 @@ impl From<SocketAddr> for CoapAddress {
 
                     coap_addr.addr.sin = sockaddr_in {
                         #[cfg(any(
+                            target_os = "macos",
+                            target_os = "ios",
                             target_os = "freebsd",
                             target_os = "dragonfly",
                             target_os = "openbsd",
@@ -174,6 +176,8 @@ impl From<SocketAddr> for CoapAddress {
                     // some fields are a bit different.
                     coap_addr.addr.sin6 = sockaddr_in6 {
                         #[cfg(any(
+                            target_os = "macos",
+                            target_os = "ios",
                             target_os = "freebsd",
                             target_os = "dragonfly",
                             target_os = "openbsd",

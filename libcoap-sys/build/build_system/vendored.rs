@@ -26,7 +26,7 @@ use crate::{
     metadata::{DtlsBackend, LibcoapDefineInfo, LibcoapFeature},
 };
 
-const VENDORED_LIBCOAP_VERSION: &str = "4.3.5";
+const VENDORED_LIBCOAP_VERSION: &str = "4.3.5b";
 
 pub struct VendoredBuildSystem {
     out_dir: PathBuf,
@@ -42,6 +42,58 @@ impl VendoredBuildSystem {
         requested_features: EnumSet<LibcoapFeature>,
         requested_dtls_backend: Option<DtlsBackend>,
     ) -> Result<Self> {
+        if cfg!(feature = "runtime-io") {
+            ensure!(
+                requested_dtls_backend.is_none_or(|v| v == DtlsBackend::OpenSsl),
+                "runtime-io uses the bundled OpenSSL backend"
+            );
+            println!("cargo:rerun-if-changed=src/libcoap");
+            let include = PathBuf::from(env::var_os("DEP_OPENSSL_INCLUDE").context("runtime-io requires openssl-sys")?);
+            let mut build = cmake::Config::new("src/libcoap");
+            build
+                .out_dir(out_dir.join("native"))
+                .define("OPENSSL_ROOT_DIR", include.parent().context("OpenSSL prefix missing")?)
+                .define("OPENSSL_USE_STATIC_LIBS", "TRUE")
+                .define("CMAKE_INSTALL_LIBDIR", "lib")
+                .cflag("-DCOAP_RXBUFFER_SIZE=65536")
+                .define("DTLS_BACKEND", "openssl");
+            for (key, value) in [
+                ("BUILD_SHARED_LIBS", "OFF"),
+                ("ENABLE_DTLS", "ON"),
+                ("ENABLE_OSCORE", "ON"),
+                ("ENABLE_CLIENT_MODE", "ON"),
+                ("ENABLE_SERVER_MODE", "ON"),
+                ("ENABLE_TCP", "ON"),
+                ("ENABLE_IPV4", "ON"),
+                ("ENABLE_IPV6", "ON"),
+                ("ENABLE_ASYNC", "ON"),
+                ("WITH_EPOLL", "OFF"),
+                ("ENABLE_THREAD_SAFE", "ON"),
+                ("ENABLE_THREAD_RECURSIVE_LOCK_CHECK", "ON"),
+                ("ENABLE_WS", "OFF"),
+                ("ENABLE_AF_UNIX", "OFF"),
+                ("ENABLE_PROXY_CODE", "OFF"),
+                ("WITH_OBSERVE_PERSIST", "OFF"),
+                ("ENABLE_Q_BLOCK", "OFF"),
+                ("ENABLE_EXAMPLES", "OFF"),
+                ("ENABLE_TESTS", "OFF"),
+                ("ENABLE_DOCS", "OFF"),
+            ] {
+                build.define(key, value);
+            }
+            let prefix = build.build();
+            println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
+            println!("cargo:rustc-link-lib=static=coap-3");
+            if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+                println!("cargo:rustc-link-lib=ws2_32");
+            }
+            println!("cargo:rustc-cfg=used_dtls_crate=\"openssl\"");
+            return Ok(Self {
+                out_dir,
+                define_info: None,
+                include_paths: vec![prefix.join("include")],
+            });
+        }
         println!("cargo:rerun-if-changed=src/libcoap");
 
         let libcoap_src_dir = out_dir.join("libcoap");
@@ -392,7 +444,7 @@ impl BuildSystem for VendoredBuildSystem {
     }
 
     fn version(&self) -> Option<Version> {
-        Version::from(VENDORED_LIBCOAP_VERSION)
+        Version::from("4.3.5")
     }
 
     fn generate_bindings(&mut self) -> anyhow::Result<PathBuf> {

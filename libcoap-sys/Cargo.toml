@@ -10,7 +10,7 @@
 [package]
 name = "libcoap-sys"
 description = "Raw bindings to the libcoap CoAP library."
-version = "0.2.2+libcoap-4.3.1"
+version = "0.2.2+libcoap-4.3.5b"
 edition = "2021"
 license = "BSD-2-Clause AND BSD-1-Clause"
 links = "coap-3"
@@ -28,6 +28,7 @@ build = "build/main.rs"
 rust-version = "1.88.0"
 
 [features]
+runtime-io = ["vendored", "dtls-openssl-sys-vendored"]
 # The default features match those of libcoap's configure script for
 # the minimum supported version.
 default = [
@@ -151,6 +152,7 @@ esp-idf-sys = { version = "0.36.1" }
 libc = "0.2.126"
 
 [build-dependencies]
+cmake = "0.1.54"
 bindgen = { version = "0.71.1" }
 autotools = "^0.2.3"
 fs_extra = "^1.2"
