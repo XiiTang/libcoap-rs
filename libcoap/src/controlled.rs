@@ -102,7 +102,7 @@ impl Client {
         callbacks: Box<dyn Callbacks>,
     ) -> Result<Self, &'static str> {
         if !(64..=16 * 1024 * 1024).contains(&limits.maximum_pdu)
-            || limits.maximum_body < limits.maximum_pdu
+            || limits.maximum_body == 0
             || limits.maximum_options > 128
             || limits.maximum_retransmit > 8
             || !(100..=60000).contains(&limits.ack_timeout_ms)
@@ -264,7 +264,8 @@ impl Client {
                     }
                 }
             }
-            coap_session_set_mtu(client.session, limits.maximum_pdu.min(65507) as u32);
+            // Keep the native transmit MTU. The receive allocation bound is not
+            // an instruction to send maximum-sized UDP datagrams.
             coap_session_set_max_retransmit(client.session, limits.maximum_retransmit);
             coap_session_set_ack_timeout(
                 client.session,

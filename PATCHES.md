@@ -24,3 +24,7 @@ The embedding application's independent fixtures cover request/response,
 streaming, multicast, credential security, malformed/negative results, delivery
 bounds, context persistence, cancellation and shutdown. Cross-platform release
 packaging must separately validate the platform compiler, CMake and static link.
+
+## Resource simplification (2026-09-14)
+
+Keep the native transmit MTU instead of deriving it from the receive allocation bound. Outgoing materialized body bounds are independent of PDU receive bounds. Native blockwise/CSM negotiation, parser protections and checked lengths remain unchanged. Validation coverage: Runtime UDP/TCP/TLS/DTLS, blockwise, Observe and multicast interoperability suite.
