@@ -328,7 +328,7 @@ impl Client {
                 } else {
                     coap_pdu_type_t_COAP_MESSAGE_NON
                 },
-                u32::from(code),
+                code.into(),
                 i32::from(coap_new_message_id(self.session)),
                 self.state.maximum_pdu,
             );
@@ -566,7 +566,7 @@ unsafe extern "C" fn nack(
             } else {
                 unsafe { std::slice::from_raw_parts(token.s, token.length) }.to_vec()
             },
-            reason,
+            reason: reason as u32,
             mid,
         };
         if !s.callbacks.event(value) {

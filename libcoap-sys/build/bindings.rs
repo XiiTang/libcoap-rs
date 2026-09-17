@@ -92,8 +92,18 @@ impl ParseCallbacks for LibcoapBindingHelper {
             ) => Some(ImplementsTrait::Yes),
             (_, _) => None,
         }
-        #[cfg(not(unix))]
-        // Let's just assume that bindgen's default behavior is fine.
+        #[cfg(windows)]
+        match (name, derive_trait) {
+            ("fd_set" | "struct sockaddr_in" | "struct sockaddr_in6" | "struct sockaddr", DeriveTrait::Copy) => {
+                Some(ImplementsTrait::Yes)
+            },
+            ("fd_set" | "struct sockaddr_in" | "struct sockaddr_in6" | "struct sockaddr", _) => {
+                Some(ImplementsTrait::No)
+            },
+            ("time_t" | "socklen_t" | "sa_family_t", _) => Some(ImplementsTrait::Yes),
+            _ => None,
+        }
+        #[cfg(not(any(unix, windows)))]
         None
     }
 }

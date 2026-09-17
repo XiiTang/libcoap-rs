@@ -28,3 +28,12 @@ packaging must separately validate the platform compiler, CMake and static link.
 ## Resource simplification (2026-09-14)
 
 Keep the native transmit MTU instead of deriving it from the receive allocation bound. Outgoing materialized body bounds are independent of PDU receive bounds. Native blockwise/CSM negotiation, parser protections and checked lengths remain unchanged. Validation coverage: Runtime UDP/TCP/TLS/DTLS, blockwise, Observe and multicast interoperability suite.
+
+## Windows socket ABI (2026-09-18)
+
+The Windows build uses the Winsock structures from `windows-sys` instead of Unix
+libc socket types. Bindgen is told that these external structures implement Copy,
+so native address unions retain their correct representation. IPv4, IPv6, scope
+IDs, flow information and ports use the Windows field layout. CoAP code and NACK
+values account for MSVC's signed C enums without changing the native protocol.
+The native Windows address roundtrip regression passed for IPv4 and scoped IPv6.

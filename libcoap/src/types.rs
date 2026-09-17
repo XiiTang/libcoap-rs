@@ -22,8 +22,10 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(not(windows))]
+use libcoap_sys::c_stdlib::{in6_addr, in_addr, sa_family_t};
 use libcoap_sys::{
-    c_stdlib::{in6_addr, in_addr, sa_family_t, sockaddr_in, sockaddr_in6, socklen_t, AF_INET, AF_INET6},
+    c_stdlib::{sockaddr_in, sockaddr_in6, socklen_t, AF_INET, AF_INET6},
     coap_address_t, coap_delete_optlist, coap_mid_t, coap_proto_t, coap_proto_t_COAP_PROTO_DTLS,
     coap_proto_t_COAP_PROTO_NONE, coap_proto_t_COAP_PROTO_TCP, coap_proto_t_COAP_PROTO_TLS,
     coap_proto_t_COAP_PROTO_UDP, coap_split_proxy_uri, coap_split_uri, coap_str_const_t, coap_string_equal,
@@ -92,11 +94,12 @@ impl ToSocketAddrs for CoapAddress {
                 // SAFETY: Validity of addr is an invariant, and we checked that the type of the
                 // underlying sockaddr is actually sockaddr_in.
                 let raw_addr = unsafe { self.0.addr.sin };
-                SocketAddrV4::new(
-                    Ipv4Addr::from(raw_addr.sin_addr.s_addr.to_ne_bytes()),
-                    u16::from_be(raw_addr.sin_port),
-                )
-                .into()
+                #[cfg(not(windows))]
+                let address = raw_addr.sin_addr.s_addr.to_ne_bytes();
+                #[cfg(windows)]
+                // SAFETY: Winsock stores the IPv4 address in the S_addr union member.
+                let address = unsafe { raw_addr.sin_addr.S_un.S_addr.to_ne_bytes() };
+                SocketAddrV4::new(Ipv4Addr::from(address), u16::from_be(raw_addr.sin_port)).into()
             },
             AF_INET6 => {
                 // SAFETY: Validity of addr is an invariant, and we checked that the type of the
@@ -104,17 +107,25 @@ impl ToSocketAddrs for CoapAddress {
                 let raw_addr = unsafe { self.0.addr.sin6 };
 
                 // The esp_idf_sys definition of sockaddr_in6 differs slightly.
-                #[cfg(not(target_os = "espidf"))]
+                #[cfg(all(not(target_os = "espidf"), not(windows)))]
                 let raw_addr_bytes = raw_addr.sin6_addr.s6_addr;
                 #[cfg(target_os = "espidf")]
                 // SAFETY: Both representations are valid.
                 let raw_addr_bytes = unsafe { raw_addr.sin6_addr.un.u8_addr };
 
+                #[cfg(windows)]
+                // SAFETY: Byte and word representations cover the same IPv6 bytes.
+                let raw_addr_bytes = unsafe { raw_addr.sin6_addr.u.Byte };
+                #[cfg(not(windows))]
+                let scope = raw_addr.sin6_scope_id;
+                #[cfg(windows)]
+                // SAFETY: The address constructor initializes the scope-id member.
+                let scope = unsafe { raw_addr.Anonymous.sin6_scope_id };
                 SocketAddrV6::new(
                     Ipv6Addr::from(raw_addr_bytes),
                     u16::from_be(raw_addr.sin6_port),
                     raw_addr.sin6_flowinfo,
-                    raw_addr.sin6_scope_id,
+                    scope,
                 )
                 .into()
             },
@@ -138,27 +149,36 @@ impl From<SocketAddr> for CoapAddress {
                         addr: std::mem::zeroed(),
                     };
 
-                    coap_addr.addr.sin = sockaddr_in {
-                        #[cfg(any(
-                            target_os = "macos",
-                            target_os = "ios",
-                            target_os = "freebsd",
-                            target_os = "dragonfly",
-                            target_os = "openbsd",
-                            target_os = "netbsd",
-                            target_os = "aix",
-                            target_os = "haiku",
-                            target_os = "hurd",
-                            target_os = "espidf",
-                        ))]
-                        sin_len: (std::mem::size_of::<sockaddr_in>() as u8),
-                        sin_family: AF_INET as sa_family_t,
-                        sin_port: addr.port().to_be(),
-                        sin_addr: in_addr {
-                            s_addr: u32::from_ne_bytes(addr.ip().octets()),
-                        },
-                        sin_zero: Default::default(),
-                    };
+                    #[cfg(not(windows))]
+                    {
+                        coap_addr.addr.sin = sockaddr_in {
+                            #[cfg(any(
+                                target_os = "macos",
+                                target_os = "ios",
+                                target_os = "freebsd",
+                                target_os = "dragonfly",
+                                target_os = "openbsd",
+                                target_os = "netbsd",
+                                target_os = "aix",
+                                target_os = "haiku",
+                                target_os = "hurd",
+                                target_os = "espidf",
+                            ))]
+                            sin_len: (std::mem::size_of::<sockaddr_in>() as u8),
+                            sin_family: AF_INET as sa_family_t,
+                            sin_port: addr.port().to_be(),
+                            sin_addr: in_addr {
+                                s_addr: u32::from_ne_bytes(addr.ip().octets()),
+                            },
+                            sin_zero: Default::default(),
+                        };
+                    }
+                    #[cfg(windows)]
+                    {
+                        coap_addr.addr.sin.sin_family = AF_INET;
+                        coap_addr.addr.sin.sin_port = addr.port().to_be();
+                        coap_addr.addr.sin.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.ip().octets());
+                    }
                     CoapAddress(coap_addr)
                 }
             },
@@ -174,34 +194,44 @@ impl From<SocketAddr> for CoapAddress {
 
                     // Representation of sockaddr_in6 differs depending on the used OS, therefore
                     // some fields are a bit different.
-                    coap_addr.addr.sin6 = sockaddr_in6 {
-                        #[cfg(any(
-                            target_os = "macos",
-                            target_os = "ios",
-                            target_os = "freebsd",
-                            target_os = "dragonfly",
-                            target_os = "openbsd",
-                            target_os = "netbsd",
-                            target_os = "aix",
-                            target_os = "haiku",
-                            target_os = "hurd",
-                            target_os = "espidf",
-                        ))]
-                        sin6_len: (std::mem::size_of::<sockaddr_in6>() as u8),
-                        sin6_family: AF_INET6 as sa_family_t,
-                        sin6_port: addr.port().to_be(),
-                        sin6_addr: in6_addr {
-                            #[cfg(not(target_os = "espidf"))]
-                            s6_addr: addr.ip().octets(),
-                            #[cfg(target_os = "espidf")]
-                            un: libcoap_sys::c_stdlib::in6_addr__bindgen_ty_1 {
-                                u8_addr: addr.ip().octets(),
+                    #[cfg(not(windows))]
+                    {
+                        coap_addr.addr.sin6 = sockaddr_in6 {
+                            #[cfg(any(
+                                target_os = "macos",
+                                target_os = "ios",
+                                target_os = "freebsd",
+                                target_os = "dragonfly",
+                                target_os = "openbsd",
+                                target_os = "netbsd",
+                                target_os = "aix",
+                                target_os = "haiku",
+                                target_os = "hurd",
+                                target_os = "espidf",
+                            ))]
+                            sin6_len: (std::mem::size_of::<sockaddr_in6>() as u8),
+                            sin6_family: AF_INET6 as sa_family_t,
+                            sin6_port: addr.port().to_be(),
+                            sin6_addr: in6_addr {
+                                #[cfg(not(target_os = "espidf"))]
+                                s6_addr: addr.ip().octets(),
+                                #[cfg(target_os = "espidf")]
+                                un: libcoap_sys::c_stdlib::in6_addr__bindgen_ty_1 {
+                                    u8_addr: addr.ip().octets(),
+                                },
                             },
-                        },
-                        sin6_flowinfo: addr.flowinfo(),
-                        sin6_scope_id: addr.scope_id(),
-                    };
-
+                            sin6_flowinfo: addr.flowinfo(),
+                            sin6_scope_id: addr.scope_id(),
+                        };
+                    }
+                    #[cfg(windows)]
+                    {
+                        coap_addr.addr.sin6.sin6_family = AF_INET6;
+                        coap_addr.addr.sin6.sin6_port = addr.port().to_be();
+                        coap_addr.addr.sin6.sin6_addr.u.Byte = addr.ip().octets();
+                        coap_addr.addr.sin6.sin6_flowinfo = addr.flowinfo();
+                        coap_addr.addr.sin6.Anonymous.sin6_scope_id = addr.scope_id();
+                    }
                     CoapAddress(coap_addr)
                 }
             },
@@ -965,4 +995,21 @@ pub(crate) fn decode_var_len_u8(val: &[u8]) -> u16 {
 
 pub(crate) fn encode_var_len_u8(val: u8) -> Box<[u8]> {
     Vec::from([val]).into_boxed_slice()
+}
+
+#[cfg(test)]
+mod address_roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_and_scoped_ipv6_preserve_the_native_socket_layout() {
+        let addresses = [
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 17), 5683)),
+            SocketAddr::V6(SocketAddrV6::new("fe80::1234:5678".parse().unwrap(), 5684, 17, 9)),
+        ];
+        for expected in addresses {
+            let raw = CoapAddress::from(expected);
+            assert_eq!(raw.to_socket_addrs().unwrap().next(), Some(expected));
+        }
+    }
 }
