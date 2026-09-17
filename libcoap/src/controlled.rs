@@ -644,3 +644,28 @@ pub fn encode_uint(value: u64) -> Vec<u8> {
     let length = unsafe { coap_encode_var_safe8(bytes.as_mut_ptr(), bytes.len(), value) };
     bytes[..length as usize].to_vec()
 }
+
+#[cfg(test)]
+mod controlled_io_tests {
+    use super::*;
+    struct Idle;
+    impl Callbacks for Idle {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn event(&mut self, _: Event) -> bool { true }
+    }
+    #[test]
+    fn supplied_io_polls_without_native_socket_descriptors() {
+        for tcp in [false, true] {
+            let mut client = Client::new("127.0.0.1:5683".parse().unwrap(), tcp,
+                Security::None, None, Limits { maximum_pdu: 1024, maximum_body: 4096,
+                    maximum_options: 128, maximum_retransmit: 4, ack_timeout_ms: 2000 },
+                Box::new(Idle)).unwrap();
+            for _ in 0..3 { client.poll().unwrap(); }
+        }
+    }
+}

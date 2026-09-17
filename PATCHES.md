@@ -1,7 +1,7 @@
 # Runtime client binding
 
 Base: namib-project/libcoap-rs `0dbf5d33eae294cd16ff5111e6d992f087fb0eae`.
-The libcoap submodule pins the controlled-runtime fork of upstream v4.3.5b (`2bbd80b34b89fb07e3389b69b32112def23bd5cf`).
+The libcoap submodule pins the controlled-runtime fork of upstream v4.3.5b (`d23c588856e21a53573719070e5e7ceb46fc8ccb`).
 Both repositories retain their upstream BSD licenses and history.
 
 `runtime-io` adds `controlled::Client`: one !Send context/session owner, supplied
@@ -37,3 +37,11 @@ so native address unions retain their correct representation. IPv4, IPv6, scope
 IDs, flow information and ports use the Windows field layout. CoAP code and NACK
 values account for MSVC's signed C enums without changing the native protocol.
 The native Windows address roundtrip regression passed for IPv4 and scoped IPv6.
+
+## Windows supplied-I/O polling (2026-09-18)
+
+The native submodule handles Winsock's rejection of empty descriptor sets while
+retaining bounded callback polling and the caller-owned network transport.
+`controlled_io_tests::supplied_io_polls_without_native_socket_descriptors` covers
+UDP and TCP clients with only supplied callbacks. The product's oversized reliable
+frame fixture additionally checks real TCP startup and immediate parser rejection.
