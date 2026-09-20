@@ -663,7 +663,7 @@ mod controlled_io_tests {
         for key in [vec![], b"secretPSK".to_vec(), vec![1;65]] {
             let valid = !key.is_empty() && key.len() <= 64;
             let result = Client::new("127.0.0.1:5684".parse().unwrap(), false,
-                Security::Psk { identity: b"fixture".to_vec(), key, sni: "localhost".into() },
+                Security::Psk { identity: Zeroizing::new(b"fixture".to_vec()), key: Zeroizing::new(key), sni: "localhost".into() },
                 None, Limits { maximum_pdu: 1024, maximum_body: 4096,
                     maximum_options: 128, maximum_retransmit: 4, ack_timeout_ms: 2000 }, Box::new(Idle));
             assert_eq!(result.is_ok(), valid);
