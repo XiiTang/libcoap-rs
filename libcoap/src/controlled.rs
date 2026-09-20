@@ -188,7 +188,7 @@ impl Client {
                     }
                 },
                 Security::Psk { identity, key, sni } => {
-                    if identity.is_empty() || identity.len() > 128 || key.len() < 16 || key.len() > 64 {
+                    if identity.is_empty() || identity.len() > 128 || key.is_empty() || key.len() > 64 {
                         if !conf.is_null() {
                             coap_delete_oscore_conf(conf);
                         }
@@ -657,6 +657,17 @@ mod controlled_io_tests {
             Ok(bytes.len())
         }
         fn event(&mut self, _: Event) -> bool { true }
+    }
+    #[test]
+    fn psk_accepts_short_nonempty_protocol_keys() {
+        for key in [vec![], b"secretPSK".to_vec(), vec![1;65]] {
+            let valid = !key.is_empty() && key.len() <= 64;
+            let result = Client::new("127.0.0.1:5684".parse().unwrap(), false,
+                Security::Psk { identity: b"fixture".to_vec(), key, sni: "localhost".into() },
+                None, Limits { maximum_pdu: 1024, maximum_body: 4096,
+                    maximum_options: 128, maximum_retransmit: 4, ack_timeout_ms: 2000 }, Box::new(Idle));
+            assert_eq!(result.is_ok(), valid);
+        }
     }
     #[test]
     fn supplied_io_polls_without_native_socket_descriptors() {
