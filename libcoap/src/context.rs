@@ -17,7 +17,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 use std::{
     any::Any,
-    ffi::{c_void, CStr},
+    ffi::{CStr, c_void},
     fmt::Debug,
     net::SocketAddr,
     ops::Sub,
@@ -30,18 +30,18 @@ use std::{os::unix::ffi::OsStrExt, path::Path};
 #[cfg(feature = "dtls-pki")]
 use libcoap_sys::coap_context_set_pki_root_cas;
 use libcoap_sys::{
-    coap_add_resource, coap_bin_const_t, coap_can_exit, coap_context_get_csm_max_message_size,
-    coap_context_get_csm_timeout, coap_context_get_max_handshake_sessions, coap_context_get_max_idle_sessions,
-    coap_context_get_session_timeout, coap_context_set_block_mode, coap_context_set_csm_max_message_size,
-    coap_context_set_csm_timeout, coap_context_set_keepalive, coap_context_set_max_handshake_sessions,
-    coap_context_set_max_idle_sessions, coap_context_set_session_timeout, coap_context_t, coap_delete_bin_const,
-    coap_event_t, coap_event_t_COAP_EVENT_BAD_PACKET, coap_event_t_COAP_EVENT_DTLS_CLOSED,
-    coap_event_t_COAP_EVENT_DTLS_CONNECTED, coap_event_t_COAP_EVENT_DTLS_ERROR,
+    COAP_BLOCK_SINGLE_BODY, COAP_BLOCK_USE_LIBCOAP, COAP_IO_WAIT, coap_add_resource, coap_bin_const_t, coap_can_exit,
+    coap_context_get_csm_max_message_size, coap_context_get_csm_timeout, coap_context_get_max_handshake_sessions,
+    coap_context_get_max_idle_sessions, coap_context_get_session_timeout, coap_context_set_block_mode,
+    coap_context_set_csm_max_message_size, coap_context_set_csm_timeout, coap_context_set_keepalive,
+    coap_context_set_max_handshake_sessions, coap_context_set_max_idle_sessions, coap_context_set_session_timeout,
+    coap_context_t, coap_delete_bin_const, coap_event_t, coap_event_t_COAP_EVENT_BAD_PACKET,
+    coap_event_t_COAP_EVENT_DTLS_CLOSED, coap_event_t_COAP_EVENT_DTLS_CONNECTED, coap_event_t_COAP_EVENT_DTLS_ERROR,
     coap_event_t_COAP_EVENT_DTLS_RENEGOTIATE, coap_event_t_COAP_EVENT_KEEPALIVE_FAILURE,
     coap_event_t_COAP_EVENT_MSG_RETRANSMITTED, coap_event_t_COAP_EVENT_OSCORE_DECODE_ERROR,
     coap_event_t_COAP_EVENT_OSCORE_DECRYPTION_FAILURE, coap_event_t_COAP_EVENT_OSCORE_INTERNAL_ERROR,
-    coap_event_t_COAP_EVENT_OSCORE_NOT_ENABLED, coap_event_t_COAP_EVENT_OSCORE_NO_PROTECTED_PAYLOAD,
-    coap_event_t_COAP_EVENT_OSCORE_NO_SECURITY, coap_event_t_COAP_EVENT_PARTIAL_BLOCK,
+    coap_event_t_COAP_EVENT_OSCORE_NO_PROTECTED_PAYLOAD, coap_event_t_COAP_EVENT_OSCORE_NO_SECURITY,
+    coap_event_t_COAP_EVENT_OSCORE_NOT_ENABLED, coap_event_t_COAP_EVENT_PARTIAL_BLOCK,
     coap_event_t_COAP_EVENT_SERVER_SESSION_DEL, coap_event_t_COAP_EVENT_SERVER_SESSION_NEW,
     coap_event_t_COAP_EVENT_SESSION_CLOSED, coap_event_t_COAP_EVENT_SESSION_CONNECTED,
     coap_event_t_COAP_EVENT_SESSION_FAILED, coap_event_t_COAP_EVENT_TCP_CLOSED, coap_event_t_COAP_EVENT_TCP_CONNECTED,
@@ -50,7 +50,6 @@ use libcoap_sys::{
     coap_get_app_data, coap_io_process, coap_join_mcast_group_intf, coap_new_bin_const, coap_new_context, coap_proto_t,
     coap_proto_t_COAP_PROTO_DTLS, coap_proto_t_COAP_PROTO_TCP, coap_proto_t_COAP_PROTO_UDP,
     coap_register_event_handler, coap_register_response_handler, coap_set_app_data, coap_startup_with_feature_checks,
-    COAP_BLOCK_SINGLE_BODY, COAP_BLOCK_USE_LIBCOAP, COAP_IO_WAIT,
 };
 #[cfg(feature = "oscore")]
 use libcoap_sys::{coap_context_oscore_server, coap_delete_oscore_recipient, coap_new_oscore_recipient};
@@ -61,24 +60,31 @@ use crate::crypto::pki_rpk::ServerPkiRpkCryptoContext;
 use crate::crypto::psk::ServerPskContext;
 use crate::{
     error::{ContextConfigurationError, EndpointCreationError, IoProcessError, MulticastGroupJoinError},
-    event::{event_handler_callback, CoapEventHandler},
+    event::{CoapEventHandler, event_handler_callback},
     mem::{CoapLendableFfiRcCell, CoapLendableFfiWeakCell, DropInnerExclusively},
     resource::{CoapResource, UntypedCoapResource},
-    session::{session_response_handler, CoapServerSession, CoapSession},
+    session::{CoapServerSession, CoapSession, session_response_handler},
     transport::CoapEndpoint,
 };
 //TODO: New feature?
 #[cfg(feature = "oscore")]
 use crate::{
-    error::{OscoreRecipientError, OscoreServerCreationError},
     OscoreConf,
+    error::{OscoreRecipientError, OscoreServerCreationError},
 };
 
 static COAP_STARTUP_ONCE: Once = Once::new();
 
 #[inline(always)]
 pub(crate) fn ensure_coap_started() {
-    COAP_STARTUP_ONCE.call_once(|| { coap_startup_with_feature_checks(); #[cfg(feature="runtime-io")] unsafe { libcoap_sys::coap_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG); libcoap_sys::coap_dtls_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG); } });
+    COAP_STARTUP_ONCE.call_once(|| {
+        coap_startup_with_feature_checks();
+        #[cfg(feature = "runtime-io")]
+        unsafe {
+            libcoap_sys::coap_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG);
+            libcoap_sys::coap_dtls_set_log_level(libcoap_sys::coap_log_t_COAP_LOG_EMERG);
+        }
+    });
 }
 
 #[derive(Debug)]

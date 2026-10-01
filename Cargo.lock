@@ -871,6 +871,7 @@ dependencies = [
  "syn 2.0.114",
  "tinydtls-sys",
  "version-compare",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

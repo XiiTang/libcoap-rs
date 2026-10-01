@@ -4,7 +4,7 @@
 use crate::{context::ensure_coap_started, types::CoapAddress};
 use libcoap_sys::*;
 use std::{
-    ffi::{c_void, CString},
+    ffi::{CString, c_void},
     io,
     marker::PhantomData,
     net::{SocketAddr, ToSocketAddrs},
@@ -15,10 +15,23 @@ use zeroize::Zeroizing;
 
 /// Callbacks run synchronously on the client's owner thread. They must not
 /// re-enter the client. A false event/persistence result permanently stops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseDecision {
+    Accept,
+    Reject,
+    Stop,
+}
 pub trait Callbacks {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize>;
     fn event(&mut self, event: Event) -> bool;
+    fn response(&mut self, event: Event) -> ResponseDecision {
+        if self.event(event) {
+            ResponseDecision::Accept
+        } else {
+            ResponseDecision::Stop
+        }
+    }
     fn verify(&mut self, _chain: &[&[u8]]) -> bool {
         false
     }
@@ -114,7 +127,7 @@ impl Client {
         }
         match &security {
             Security::Psk { sni, .. } | Security::Certificate { sni, .. } if sni.as_bytes().contains(&0) => {
-                return Err("invalid SNI")
+                return Err("invalid SNI");
             },
             _ => {},
         }
@@ -356,11 +369,7 @@ impl Client {
             }
             let mid = coap_send(self.session, pdu);
             self.check()?;
-            if mid < 0 {
-                Err("request send failed")
-            } else {
-                Ok(mid)
-            }
+            if mid < 0 { Err("request send failed") } else { Ok(mid) }
         }
     }
     pub fn forget(&mut self, token: &[u8]) -> Result<(), &'static str> {
@@ -533,11 +542,13 @@ unsafe extern "C" fn response(
                 .next()
                 .unwrap(),
         };
-        if !s.callbacks.event(value) {
-            s.failed = true;
-            coap_response_t_COAP_RESPONSE_FAIL
-        } else {
-            coap_response_t_COAP_RESPONSE_OK
+        match s.callbacks.response(value) {
+            ResponseDecision::Accept => coap_response_t_COAP_RESPONSE_OK,
+            ResponseDecision::Reject => coap_response_t_COAP_RESPONSE_FAIL,
+            ResponseDecision::Stop => {
+                s.failed = true;
+                coap_response_t_COAP_RESPONSE_FAIL
+            },
         }
     })
 }
@@ -656,27 +667,56 @@ mod controlled_io_tests {
         fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
             Ok(bytes.len())
         }
-        fn event(&mut self, _: Event) -> bool { true }
+        fn event(&mut self, _: Event) -> bool {
+            true
+        }
     }
     #[test]
     fn psk_accepts_short_nonempty_protocol_keys() {
-        for key in [vec![], b"secretPSK".to_vec(), vec![1;65]] {
+        for key in [vec![], b"secretPSK".to_vec(), vec![1; 65]] {
             let valid = !key.is_empty() && key.len() <= 64;
-            let result = Client::new("127.0.0.1:5684".parse().unwrap(), false,
-                Security::Psk { identity: Zeroizing::new(b"fixture".to_vec()), key: Zeroizing::new(key), sni: "localhost".into() },
-                None, Limits { maximum_pdu: 1024, maximum_body: 4096,
-                    maximum_options: 128, maximum_retransmit: 4, ack_timeout_ms: 2000 }, Box::new(Idle));
+            let result = Client::new(
+                "127.0.0.1:5684".parse().unwrap(),
+                false,
+                Security::Psk {
+                    identity: Zeroizing::new(b"fixture".to_vec()),
+                    key: Zeroizing::new(key),
+                    sni: "localhost".into(),
+                },
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 4,
+                    ack_timeout_ms: 2000,
+                },
+                Box::new(Idle),
+            );
             assert_eq!(result.is_ok(), valid);
         }
     }
     #[test]
     fn supplied_io_polls_without_native_socket_descriptors() {
         for tcp in [false, true] {
-            let mut client = Client::new("127.0.0.1:5683".parse().unwrap(), tcp,
-                Security::None, None, Limits { maximum_pdu: 1024, maximum_body: 4096,
-                    maximum_options: 128, maximum_retransmit: 4, ack_timeout_ms: 2000 },
-                Box::new(Idle)).unwrap();
-            for _ in 0..3 { client.poll().unwrap(); }
+            let mut client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                tcp,
+                Security::None,
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 4,
+                    ack_timeout_ms: 2000,
+                },
+                Box::new(Idle),
+            )
+            .unwrap();
+            for _ in 0..3 {
+                client.poll().unwrap();
+            }
         }
     }
 }
