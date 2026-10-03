@@ -704,6 +704,34 @@ mod controlled_io_tests {
         message.extend_from_slice(payload);
         message
     }
+    fn scripted_client() -> (Rc<std::cell::RefCell<Wire>>, Client) {
+        let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+        let client = Client::new(
+            "127.0.0.1:5683".parse().unwrap(),
+            false,
+            Security::None,
+            None,
+            Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Scripted(wire.clone())),
+        )
+        .unwrap();
+        (wire, client)
+    }
+    fn body_incomplete(events: &[Event], expected: &[u8]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Nack { token, reason, .. }
+                    if token == expected && *reason == coap_nack_reason_t_COAP_NACK_BODY_INCOMPLETE as u32
+            )
+        })
+    }
     #[test]
     fn a_streamed_body_that_cannot_complete_fails_its_own_request_without_another() {
         // ETag 7, Block2 0/M/16, Size2 32.
@@ -716,22 +744,7 @@ mod controlled_io_tests {
             // The first block had an ETag; this one has none.
             ("missing etag", vec![0xd1, 10, 0x10, 0x51, 32]),
         ] {
-            let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
-            let mut client = Client::new(
-                "127.0.0.1:5683".parse().unwrap(),
-                false,
-                Security::None,
-                None,
-                Limits {
-                    maximum_pdu: 1024,
-                    maximum_body: 4096,
-                    maximum_options: 128,
-                    maximum_retransmit: 4,
-                    ack_timeout_ms: 2000,
-                },
-                Box::new(Scripted(wire.clone())),
-            )
-            .unwrap();
+            let (wire, mut client) = scripted_client();
             client.request(&[1], 2, true, &[(11, b"report".to_vec())], b"body".to_vec()).unwrap();
             client.poll().unwrap();
             let request = wire.borrow().written.last().unwrap().clone();
@@ -748,16 +761,30 @@ mod controlled_io_tests {
             assert_eq!(requests, 2, "{case}: nothing is requested again");
             let responses = wire.events.iter().filter(|e| matches!(e, Event::Response { .. })).count();
             assert_eq!(responses, 1, "{case}: only the first block is delivered");
-            assert!(
-                wire.events.iter().any(|event| matches!(
-                    event,
-                    Event::Nack { token, reason, .. }
-                        if token == &[1] && *reason == coap_nack_reason_t_COAP_NACK_BODY_INCOMPLETE as u32
-                )),
-                "{case}: {:?}",
-                wire.events
-            );
+            assert!(body_incomplete(&wire.events, &[1]), "{case}: {:?}", wire.events);
         }
+    }
+    #[test]
+    fn a_body_whose_blocks_outrun_tracking_fails_its_own_request_without_another() {
+        let (wire, mut client) = scripted_client();
+        client.request(&[1], 1, true, &[(11, b"large".to_vec())], vec![]).unwrap();
+        client.poll().unwrap();
+        // Each answer skips the block asked for, so every block opens a new
+        // received range: libcoap tracks three, and the fourth answer overflows.
+        for number in [0u8, 2, 4, 6] {
+            let request = wire.borrow().written.last().unwrap().clone();
+            // ETag 7, Block2 number/M/16, Size2 128.
+            let options = [0x41, 7, 0xd1, 6, (number << 4) | 8, 0x51, 128];
+            wire.borrow_mut().inbox.push_back(answer(&request, &options, &[number; 16]));
+            client.poll().unwrap();
+        }
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        let requests = wire.written.iter().filter(|packet| packet[1] != 0).count();
+        assert_eq!(requests, 4, "the request and one continuation per tracked block");
+        let responses = wire.events.iter().filter(|e| matches!(e, Event::Response { .. })).count();
+        assert_eq!(responses, 3, "the overflowing block is not delivered");
+        assert!(body_incomplete(&wire.events, &[1]), "{:?}", wire.events);
     }
     #[test]
     fn psk_accepts_short_nonempty_protocol_keys() {

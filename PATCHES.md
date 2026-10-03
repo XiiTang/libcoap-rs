@@ -54,5 +54,8 @@ continuation request) as `COAP_NACK_BODY_INCOMPLETE` with the request's own
 token, instead of restarting the request unasked or stopping silently.
 `controlled_io_tests::a_streamed_body_that_cannot_complete_fails_its_own_request_without_another`
 answers a POST blockwise by hand and checks the NACK, that only the first block
-is delivered and that no further request is written; it fails without the
-native patch.
+is delivered and that no further request is written;
+`a_body_whose_blocks_outrun_tracking_fails_its_own_request_without_another`
+skips a block in every answer until the native received-range tracking
+overflows. Both fail without the native patch. A supplied write error stops the
+client, so a continuation request that cannot be sent has no case of its own.
