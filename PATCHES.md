@@ -45,3 +45,14 @@ retaining bounded callback polling and the caller-owned network transport.
 `controlled_io_tests::supplied_io_polls_without_native_socket_descriptors` covers
 UDP and TCP clients with only supplied callbacks. The product's oversized reliable
 frame fixture additionally checks real TCP startup and immediate parser rejection.
+
+## Streamed bodies that cannot complete (2026-10-03)
+
+The native submodule reports a streamed Block2 body it cannot complete (ETag
+change, missing ETag, Content-Format change, block tracking overflow, failed
+continuation request) as `COAP_NACK_BODY_INCOMPLETE` with the request's own
+token, instead of restarting the request unasked or stopping silently.
+`controlled_io_tests::a_streamed_body_that_cannot_complete_fails_its_own_request_without_another`
+answers a POST blockwise by hand and checks the NACK, that only the first block
+is delivered and that no further request is written; it fails without the
+native patch.

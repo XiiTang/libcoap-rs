@@ -671,6 +671,94 @@ mod controlled_io_tests {
             true
         }
     }
+    /// A peer the test answers by hand: written packets and events are kept.
+    #[derive(Default)]
+    struct Wire {
+        inbox: std::collections::VecDeque<Vec<u8>>,
+        written: Vec<Vec<u8>>,
+        events: Vec<Event>,
+    }
+    struct Scripted(Rc<std::cell::RefCell<Wire>>);
+    impl Callbacks for Scripted {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            let packet = self.0.borrow_mut().inbox.pop_front().ok_or(io::ErrorKind::WouldBlock)?;
+            buffer[..packet.len()].copy_from_slice(&packet);
+            Ok((packet.len(), Some("127.0.0.1:5683".parse().unwrap())))
+        }
+        fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
+            self.0.borrow_mut().written.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+        fn event(&mut self, event: Event) -> bool {
+            self.0.borrow_mut().events.push(event);
+            true
+        }
+    }
+    /// A piggybacked 2.05 answering `request` with `options` and `payload`.
+    fn answer(request: &[u8], options: &[u8], payload: &[u8]) -> Vec<u8> {
+        let token = usize::from(request[0] & 15);
+        let mut message = vec![0x60 | token as u8, 69, request[2], request[3]];
+        message.extend_from_slice(&request[4..4 + token]);
+        message.extend_from_slice(options);
+        message.push(0xff);
+        message.extend_from_slice(payload);
+        message
+    }
+    #[test]
+    fn a_streamed_body_that_cannot_complete_fails_its_own_request_without_another() {
+        // ETag 7, Block2 0/M/16, Size2 32.
+        let first = [0x41, 7, 0xd1, 6, 0x08, 0x51, 32];
+        for (case, second) in [
+            // The representation changed: ETag 8.
+            ("etag", vec![0x41, 8, 0xd1, 6, 0x10, 0x51, 32]),
+            // Content-Format 50 where the first block had none.
+            ("content-format", vec![0x41, 7, 0x81, 50, 0xb1, 0x10, 0x51, 32]),
+            // The first block had an ETag; this one has none.
+            ("missing etag", vec![0xd1, 10, 0x10, 0x51, 32]),
+        ] {
+            let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+            let mut client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                false,
+                Security::None,
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 4,
+                    ack_timeout_ms: 2000,
+                },
+                Box::new(Scripted(wire.clone())),
+            )
+            .unwrap();
+            client.request(&[1], 2, true, &[(11, b"report".to_vec())], b"body".to_vec()).unwrap();
+            client.poll().unwrap();
+            let request = wire.borrow().written.last().unwrap().clone();
+            assert_eq!(request[1], 2, "{case}: the declared POST");
+            wire.borrow_mut().inbox.push_back(answer(&request, &first, &[b'a'; 16]));
+            client.poll().unwrap();
+            let next = wire.borrow().written.last().unwrap().clone();
+            assert_ne!(next, request, "{case}: the second block is requested");
+            wire.borrow_mut().inbox.push_back(answer(&next, &second, &[b'b'; 16]));
+            client.poll().unwrap();
+            client.poll().unwrap();
+            let wire = wire.borrow();
+            let requests = wire.written.iter().filter(|packet| packet[1] != 0).count();
+            assert_eq!(requests, 2, "{case}: nothing is requested again");
+            let responses = wire.events.iter().filter(|e| matches!(e, Event::Response { .. })).count();
+            assert_eq!(responses, 1, "{case}: only the first block is delivered");
+            assert!(
+                wire.events.iter().any(|event| matches!(
+                    event,
+                    Event::Nack { token, reason, .. }
+                        if token == &[1] && *reason == coap_nack_reason_t_COAP_NACK_BODY_INCOMPLETE as u32
+                )),
+                "{case}: {:?}",
+                wire.events
+            );
+        }
+    }
     #[test]
     fn psk_accepts_short_nonempty_protocol_keys() {
         for key in [vec![], b"secretPSK".to_vec(), vec![1; 65]] {
