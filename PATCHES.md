@@ -59,3 +59,12 @@ is delivered and that no further request is written;
 skips a block in every answer until the native received-range tracking
 overflows. Both fail without the native patch. A supplied write error stops the
 client, so a continuation request that cannot be sent has no case of its own.
+
+## OSCORE context presence
+
+The native submodule preserves absent versus present-empty ID Context in KDF
+info, option encoding and recipient-context lookup. Its CUnit regression
+`t_oscore_context_presence` fails on the previous pin and passes after the fix;
+all 178 native tests pass on macOS arm64 with OpenSSL. The Rust binding keeps
+configuration bytes intact; the embedding caller supplies quoted hex fields,
+including empty IDs, and preserves context presence in persistent-state identity.
