@@ -4,7 +4,7 @@
 use crate::{context::ensure_coap_started, types::CoapAddress};
 use libcoap_sys::*;
 use std::{
-    ffi::{CString, c_void},
+    ffi::{c_void, CString},
     io,
     marker::PhantomData,
     net::{SocketAddr, ToSocketAddrs},
@@ -90,6 +90,34 @@ pub struct Limits {
     pub maximum_retransmit: u16,
     pub ack_timeout_ms: u32,
 }
+
+/// Largest ACK timeout in milliseconds representable at this retransmission
+/// count by the bundled native engine. Zero means no timeout in its domain.
+/// The native setter domain is maximum >= 1 and ack_timeout_ms >= 1000.
+///
+/// coap_session_internal.h's MAX_TRANSMIT_WAIT multiplies
+/// `ack_ms * (2^(maximum + 1) - 1) * 1500` as signed C int *before* dividing
+/// by 1_000_000. This is the tightest bound in that domain, not a retry quota.
+/// It implies maximum <= 9 and ack_ms <= 477_218, hence:
+/// - the unsigned-char retry counter and every signed `1 << ...` fit;
+/// - coap_net.c's Q6 ACK conversion fits uint16_t (at most 30_542);
+/// - all 256 random factors in coap_calc_timeout fit its unsigned intermediates;
+/// - timeout << retransmit_cnt, including its unsigned `* 1000` debug expression,
+///   fits unsigned int (the shifted timeout is below 1_440_000 ticks);
+/// - transmit span/wait, processing delay, RTT and exchange/NON lifetimes fit
+///   signed int; their millisecond ticks fit the bundled 64-bit coap_tick_t.
+/// The runtime-io build fixes ACK_RANDOM_FACTOR at its native default 1.500,
+/// Q6/8-bit random arithmetic and 1000 ticks/second on its supported hosts.
+pub fn retransmit_ack_timeout_maximum_ms(maximum: u16) -> u32 {
+    // A signed C `1 << (maximum + 1)` must not reach its sign bit. This
+    // also excludes counts beyond the unsigned-char counter's capacity.
+    let shift = u32::from(maximum) + 1;
+    if maximum == 0 || shift >= std::ffi::c_int::BITS - 1 {
+        return 0;
+    }
+    let wait_factor = ((1u64 << shift) - 1) * 1500;
+    (std::ffi::c_int::MAX as u64 / wait_factor) as u32
+}
 struct State {
     callbacks: Box<dyn Callbacks>,
     failed: bool,
@@ -117,10 +145,13 @@ impl Client {
         if !(64..=16 * 1024 * 1024).contains(&limits.maximum_pdu)
             || limits.maximum_body == 0
             || limits.maximum_options > 128
-            || limits.maximum_retransmit > 8
-            || !(100..=60000).contains(&limits.ack_timeout_ms)
         {
             return Err("invalid client limits");
+        }
+        if limits.ack_timeout_ms < 1000
+            || limits.ack_timeout_ms > retransmit_ack_timeout_maximum_ms(limits.maximum_retransmit)
+        {
+            return Err("retransmission parameters exceed native capacity or are outside the native setter domain");
         }
         if tcp && !matches!(security, Security::None) {
             return Err("supply already verified TLS over the TCP transport");
@@ -392,7 +423,11 @@ impl Client {
             }
             let mid = coap_send(self.session, pdu);
             self.check()?;
-            if mid < 0 { Err("request send failed") } else { Ok(mid) }
+            if mid < 0 {
+                Err("request send failed")
+            } else {
+                Ok(mid)
+            }
         }
     }
     pub fn forget(&mut self, token: &[u8]) -> Result<(), &'static str> {
@@ -692,6 +727,90 @@ mod controlled_io_tests {
         }
         fn event(&mut self, _: Event) -> bool {
             true
+        }
+    }
+    #[test]
+    fn representable_retransmission_parameters_reach_the_native_session() {
+        for (maximum_retransmit, ack_timeout_ms) in [(9, 1000), (1, 477_218)] {
+            let client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                false,
+                Security::None,
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit,
+                    ack_timeout_ms,
+                },
+                Box::new(Idle),
+            )
+            .unwrap();
+            unsafe {
+                assert_eq!(coap_session_get_max_retransmit(client.session), maximum_retransmit);
+                let ack = coap_session_get_ack_timeout(client.session);
+                assert_eq!(
+                    u32::from(ack.integer_part) * 1000 + u32::from(ack.fractional_part),
+                    ack_timeout_ms
+                );
+            }
+        }
+    }
+    #[test]
+    fn native_retransmission_arithmetic_fits_at_each_joint_boundary() {
+        // Exercise the real native randomized calculation, not another engine.
+        unsafe extern "C" {
+            fn coap_calc_timeout(session: *mut coap_session_t, random: u8) -> std::ffi::c_uint;
+        }
+        for (maximum_retransmit, expected) in [
+            (1, 477_218),
+            (2, 204_522),
+            (3, 95_443),
+            (4, 46_182),
+            (5, 22_724),
+            (6, 11_272),
+            (7, 5_614),
+            (8, 2_801),
+            (9, 1_399),
+        ] {
+            let ack_timeout_ms = retransmit_ack_timeout_maximum_ms(maximum_retransmit);
+            assert_eq!(ack_timeout_ms, expected);
+            let limits = |ack_timeout_ms| Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit,
+                ack_timeout_ms,
+            };
+            let client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                false,
+                Security::None,
+                None,
+                limits(ack_timeout_ms),
+                Box::new(Idle),
+            )
+            .unwrap();
+            for random in 0..=255 {
+                let ticks = unsafe { coap_calc_timeout(client.session, random) };
+                assert!(ticks >= 1000);
+                let shifted = ticks.checked_mul(1 << maximum_retransmit).unwrap();
+                shifted.checked_mul(1000).unwrap();
+            }
+            assert!(Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                false,
+                Security::None,
+                None,
+                limits(ack_timeout_ms + 1),
+                Box::new(Idle),
+            )
+            .is_err());
+        }
+        assert_eq!(retransmit_ack_timeout_maximum_ms(10), 699);
+        for maximum in [30, 31, 255, 256, u16::MAX] {
+            assert_eq!(retransmit_ack_timeout_maximum_ms(maximum), 0);
         }
     }
     /// A peer the test answers by hand: written packets and events are kept.

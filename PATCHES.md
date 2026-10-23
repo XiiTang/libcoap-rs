@@ -84,3 +84,26 @@ No timer arithmetic or native context pointer is exposed or duplicated.
 sends a CON, waits once for the returned deadline without input, and verifies
 that the next native pass retransmits the same message. Boundless additionally
 tests this through its supplied UDP transport and sleeping worker.
+
+## Native retransmission capacity
+
+Replace the controlled client's independent retry and ACK-timeout quotas with
+`controlled::retransmit_ack_timeout_maximum_ms`, derived from the bundled
+libcoap's signed `MAX_TRANSMIT_WAIT` intermediate before division. In the native
+setter domain (at least one retransmission and a 1,000 ms ACK timeout), this
+joint bound also protects the Q6 conversion, all randomized timeout calculations,
+the unsigned-char counter, every shift and the derived waits. No native setter
+is changed. The client checks the domain and capacity before allocating native
+state; callers use the same function for their own typed admission failure.
+
+On macOS arm64,
+`controlled_io_tests::representable_retransmission_parameters_reach_the_native_session`
+fails at the previous pin with `invalid client limits` and passes with this
+patch: nine retries at 1,000 ms and one retry at 477,218 ms reach the native
+session unchanged.
+`native_retransmission_arithmetic_fits_at_each_joint_boundary` checks every
+admissible count's exact boundary and its first unrepresentable timeout,
+and calls the native `coap_calc_timeout` for all 256 random values at each
+boundary, checking the shifted timeout and its millisecond conversion.
+The scoped controlled-I/O run passed, including the existing streamed-body,
+PSK and supplied-I/O regressions. Other supported hosts retain their platform gates.
