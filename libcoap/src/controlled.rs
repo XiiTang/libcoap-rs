@@ -311,6 +311,29 @@ impl Client {
         }
         self.check()
     }
+
+    /// Prepare an external event-loop wait, processing any due native timers.
+    ///
+    /// `None` means no native timer requires a wake. Otherwise the caller must
+    /// poll again within the returned duration, or sooner when supplied I/O,
+    /// commands or cancellation become ready. This uses libcoap's event-loop
+    /// interface, including its retransmission, DTLS and block-transfer timers.
+    pub fn prepare_wait(&mut self) -> Result<Option<std::time::Duration>, &'static str> {
+        self.check()?;
+        let milliseconds = unsafe {
+            let mut now = 0;
+            coap_ticks(&mut now);
+            if coap_epoll_is_supported() != 0 {
+                coap_io_prepare_epoll(self.context, now)
+            } else {
+                let mut count = 0;
+                coap_io_prepare_io(self.context, ptr::null_mut(), 0, &mut count, now)
+            }
+        };
+        self.check()?;
+        Ok((milliseconds != 0).then_some(std::time::Duration::from_millis(u64::from(milliseconds))))
+    }
+
     pub fn request(
         &mut self,
         token: &[u8],
@@ -722,6 +745,28 @@ mod controlled_io_tests {
         )
         .unwrap();
         (wire, client)
+    }
+    #[test]
+    fn external_wait_preserves_a_silent_peers_retransmission() {
+        let (wire, mut client) = scripted_client();
+        let token = [0x71];
+        client.request(&token, 1, true, &[], Vec::new()).unwrap();
+        assert_eq!(wire.borrow().written.len(), 1);
+        let wait = client
+            .prepare_wait()
+            .unwrap()
+            .expect("a CON has a retransmission timer");
+        assert!(wait <= std::time::Duration::from_secs(3));
+        // Wall clock: libcoap's own retransmission timer is the subject. No
+        // input or repeated poll drives it before the returned native wait.
+        std::thread::sleep(wait + std::time::Duration::from_millis(1));
+        client.poll().unwrap();
+        {
+            let wire = wire.borrow();
+            assert_eq!(wire.written.len(), 2);
+            assert_eq!(wire.written[0], wire.written[1]);
+        }
+        client.forget(&token).unwrap();
     }
     fn body_incomplete(events: &[Event], expected: &[u8]) -> bool {
         events.iter().any(|event| {

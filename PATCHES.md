@@ -68,3 +68,19 @@ info, option encoding and recipient-context lookup. Its CUnit regression
 all 178 native tests pass on macOS arm64 with OpenSSL. The Rust binding keeps
 configuration bytes intact; the embedding caller supplies quoted hex fields,
 including empty IDs, and preserves context presence in persistent-state identity.
+
+## External event-loop deadline (W11g)
+
+`controlled::Client::prepare_wait` exposes the wait libcoap computes through
+`coap_io_prepare_io` or `coap_io_prepare_epoll`, according to the compiled
+engine's support. A zero native wait means no timer deadline. Preparing also
+processes due timers, as the native external event-loop contract specifies.
+The caller wakes on supplied I/O and the next native deadline instead of
+polling at a fixed interval. Without the native deadline, a caller sleeping
+only for arrivals stalls retransmissions and DTLS when the peer is silent.
+No timer arithmetic or native context pointer is exposed or duplicated.
+
+`controlled_io_tests::external_wait_preserves_a_silent_peers_retransmission`
+sends a CON, waits once for the returned deadline without input, and verifies
+that the next native pass retransmits the same message. Boundless additionally
+tests this through its supplied UDP transport and sleeping worker.
