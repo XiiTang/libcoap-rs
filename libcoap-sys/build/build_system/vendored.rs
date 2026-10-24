@@ -91,7 +91,7 @@ impl VendoredBuildSystem {
             return Ok(Self {
                 out_dir,
                 define_info: None,
-                include_paths: vec![prefix.join("include")],
+                include_paths: vec![prefix.join("include"), include],
             });
         }
         println!("cargo:rerun-if-changed=src/libcoap");
@@ -451,6 +451,11 @@ impl BuildSystem for VendoredBuildSystem {
         let (define_info, define_parser) = LibcoapDefineParser::new();
         let bindings = generate_libcoap_bindings(
             |builder| {
+                let builder = if cfg!(feature = "runtime-io") {
+                    builder.clang_arg("-DLIBCOAP_RS_RUNTIME_IO")
+                } else {
+                    builder
+                };
                 Ok(builder
                     .parse_callbacks(Box::new(define_parser))
                     // If the pkg-config provided include path coincides with a system include directory,

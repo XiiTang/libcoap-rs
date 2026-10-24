@@ -122,3 +122,52 @@ maximum is delivered whole, and one above that maximum ends the native client
 without delivery. The corrected regression fails on the previous native pin
 and passes with this patch on macOS arm64. Boundless additionally tests its
 configured PDU and outgoing option checkpoint.
+
+## Rule 20: partial quota revert of 55f1dae
+
+The driver-plan Rule 20 fork audit requires removing program-chosen option and
+PSK quotas while retaining the controlled client and its other behavior. At
+`a3db252`, `libcoap/src/controlled.rs:147,380` imposes an outgoing option-count
+quota, and `:235` refuses identities above 128 bytes and keys above 64 bytes.
+Those counts are not native capacities. Receive-side option/allocation
+protection, encoded-message checks, short nonempty PSKs, OSCORE, native numeric
+ranges and the other controlled APIs remain in place.
+
+The native OpenSSL implementation supplies the precedent and the boundary:
+`src/coap_openssl.c:827-850` reserves an identity NUL and otherwise truncates to
+its callback buffer lengths. OpenSSL's `ssl/statem/statem_clnt.c` PSK preamble
+passes `PSK_MAX_IDENTITY_LEN` identity buffer bytes and `PSK_MAX_PSK_LEN` key
+bytes (3.5.5:3030-3051; 3.6.3:3072-3093). Accordingly the controlled binding
+exports `PSK_IDENTITY_MAXIMUM_BYTES` and `PSK_KEY_MAXIMUM_BYTES`, derived by
+bindgen from the exact OpenSSL headers used for the native build: currently
+255 identity payload bytes and 512 key bytes. `Client::new` checks both before
+creating its native PSK session and names the exceeded native capacity rather
+than letting the callback truncate. No native submodule patch is needed.
+`Limits::maximum_options` now governs received options only; it has no fixed
+128-entry configuration ceiling and never limits an outgoing request.
+
+On macOS arm64, adding the outgoing 129-option wire regression and the real
+DTLS peer regression to `a3db252` produced the two expected refusals (exit 101).
+After this patch `cargo test -p libcoap-rs --features runtime-io --locked --
+--test-threads=1` passes all 33 unit, integration and documentation tests:
+
+- `outgoing_options_are_not_limited_by_the_receive_option_count` independently
+  decodes the written packet and verifies every caller option, alongside the
+  native Request-Tag.
+- `psk_native_capacity_reaches_the_peer_without_truncation` establishes DTLS
+  with 129/65-byte credentials and at the exported identity/key boundaries.
+  The peer selects a key only for the complete identity; Finished proves use
+  of the complete key.
+- `psk_excess_names_the_native_capacity_before_native_session_creation` checks
+  both first excessive lengths. `psk_accepts_short_nonempty_protocol_keys`
+  retains short-key coverage and no longer asserts the removed 64-byte quota.
+- `the_supplied_receive_option_limit_still_protects_the_callback` admits 129
+  received options at that configured bound and refuses 130.
+
+The macOS `libcoap-sys` own tests are blocked by existing `sockaddr_in` and
+`sockaddr_in6` fixture initializers missing `sin_len`/`sin6_len`
+(`libcoap-sys/src/lib.rs:548,568`); the same command fails with exit 101 after
+restoring the original sys build script and wrapper. Whole-fork formatting
+also reports the original import ordering in `libcoap/src/context.rs`; changed
+Rust files pass the formatter. These unrelated baseline defects are not repaired
+by this patch. Other supported hosts retain their separate platform gates.

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
 //! A single-thread-owned client using supplied I/O. The native engine owns all
 //! CoAP exchanges, retransmission, Observe, Block1/2, BERT, DTLS and OSCORE.
-use crate::{context::ensure_coap_started, types::CoapAddress};
-use libcoap_sys::*;
 use std::{
     ffi::{c_void, CString},
     io,
@@ -11,7 +9,11 @@ use std::{
     ptr,
     rc::Rc,
 };
+
+use libcoap_sys::*;
 use zeroize::Zeroizing;
+
+use crate::{context::ensure_coap_started, types::CoapAddress};
 
 /// Callbacks run synchronously on the client's owner thread. They must not
 /// re-enter the client. A false event/persistence result permanently stops it.
@@ -86,10 +88,17 @@ pub struct Oscore {
 pub struct Limits {
     pub maximum_pdu: usize,
     pub maximum_body: usize,
+    /// Maximum received option count; outgoing requests have no count quota.
     pub maximum_options: usize,
     pub maximum_retransmit: u16,
     pub ack_timeout_ms: u32,
 }
+
+/// Maximum identity payload bytes in the bundled OpenSSL PSK callback. The
+/// native callback reserves one byte of PSK_MAX_IDENTITY_LEN for a NUL.
+pub const PSK_IDENTITY_MAXIMUM_BYTES: usize = COAP_RUNTIME_PSK_IDENTITY_MAXIMUM_BYTES as usize;
+/// Maximum key bytes in the bundled OpenSSL PSK callback (PSK_MAX_PSK_LEN).
+pub const PSK_KEY_MAXIMUM_BYTES: usize = COAP_RUNTIME_PSK_KEY_MAXIMUM_BYTES as usize;
 
 /// Largest ACK timeout in milliseconds representable at this retransmission
 /// count by the bundled native engine. Zero means no timeout in its domain.
@@ -142,10 +151,7 @@ impl Client {
         limits: Limits,
         callbacks: Box<dyn Callbacks>,
     ) -> Result<Self, &'static str> {
-        if !(64..=u32::MAX as usize).contains(&limits.maximum_pdu)
-            || limits.maximum_body == 0
-            || limits.maximum_options > 128
-        {
+        if !(64..=u32::MAX as usize).contains(&limits.maximum_pdu) || limits.maximum_body == 0 {
             return Err("invalid client limits");
         }
         if limits.ack_timeout_ms < 1000
@@ -232,11 +238,20 @@ impl Client {
                     }
                 },
                 Security::Psk { identity, key, sni } => {
-                    if identity.is_empty() || identity.len() > 128 || key.is_empty() || key.len() > 64 {
+                    let refusal = if identity.len() > PSK_IDENTITY_MAXIMUM_BYTES {
+                        Some("PSK identity exceeds native PSK_MAX_IDENTITY_LEN minus its NUL terminator")
+                    } else if key.len() > PSK_KEY_MAXIMUM_BYTES {
+                        Some("PSK key exceeds native PSK_MAX_PSK_LEN")
+                    } else if identity.is_empty() || key.is_empty() {
+                        Some("invalid PSK bounds")
+                    } else {
+                        None
+                    };
+                    if let Some(refusal) = refusal {
                         if !conf.is_null() {
                             coap_delete_oscore_conf(conf);
                         }
-                        return Err("invalid PSK bounds");
+                        return Err(refusal);
                     }
                     let sni = CString::new(sni.as_str()).map_err(|_| "invalid SNI")?;
                     let mut psk: coap_dtls_cpsk_t = std::mem::zeroed();
@@ -322,10 +337,12 @@ impl Client {
             Ok(client)
         }
     }
+
     pub fn ready(&self) -> bool {
         !self.state.failed
             && unsafe { coap_session_get_state(self.session) == coap_session_state_t_COAP_SESSION_STATE_ESTABLISHED }
     }
+
     pub fn check(&self) -> Result<(), &'static str> {
         if self.state.failed {
             Err("controlled client stopped")
@@ -333,6 +350,7 @@ impl Client {
             Ok(())
         }
     }
+
     pub fn poll(&mut self) -> Result<(), &'static str> {
         self.check()?;
         unsafe {
@@ -374,12 +392,7 @@ impl Client {
         payload: Vec<u8>,
     ) -> Result<i32, &'static str> {
         self.check()?;
-        if token.is_empty()
-            || token.len() > 8
-            || !(1..=7).contains(&code)
-            || options.len() > self.state.maximum_options
-            || payload.len() > self.maximum_body
-        {
+        if token.is_empty() || token.len() > 8 || !(1..=7).contains(&code) || payload.len() > self.maximum_body {
             return Err("request limits exceeded");
         }
         if options.windows(2).any(|w| w[0].0 > w[1].0)
@@ -430,6 +443,7 @@ impl Client {
             }
         }
     }
+
     pub fn forget(&mut self, token: &[u8]) -> Result<(), &'static str> {
         self.check()?;
         unsafe {
@@ -439,6 +453,7 @@ impl Client {
         }
         Ok(())
     }
+
     pub fn cancel_observe(&mut self, token: &[u8]) -> Result<(), &'static str> {
         self.check()?;
         let mut token = token.to_vec();
@@ -722,9 +737,11 @@ mod controlled_io_tests {
         fn read(&mut self, _: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
             Err(io::ErrorKind::WouldBlock.into())
         }
+
         fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
             Ok(bytes.len())
         }
+
         fn event(&mut self, _: Event) -> bool {
             true
         }
@@ -827,10 +844,12 @@ mod controlled_io_tests {
             buffer[..packet.len()].copy_from_slice(&packet);
             Ok((packet.len(), Some("127.0.0.1:5683".parse().unwrap())))
         }
+
         fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
             self.0.borrow_mut().written.push(bytes.to_vec());
             Ok(bytes.len())
         }
+
         fn event(&mut self, event: Event) -> bool {
             self.0.borrow_mut().events.push(event);
             true
@@ -909,7 +928,9 @@ mod controlled_io_tests {
             ("missing etag", vec![0xd1, 10, 0x10, 0x51, 32]),
         ] {
             let (wire, mut client) = scripted_client();
-            client.request(&[1], 2, true, &[(11, b"report".to_vec())], b"body".to_vec()).unwrap();
+            client
+                .request(&[1], 2, true, &[(11, b"report".to_vec())], b"body".to_vec())
+                .unwrap();
             client.poll().unwrap();
             let request = wire.borrow().written.last().unwrap().clone();
             assert_eq!(request[1], 2, "{case}: the declared POST");
@@ -923,7 +944,11 @@ mod controlled_io_tests {
             let wire = wire.borrow();
             let requests = wire.written.iter().filter(|packet| packet[1] != 0).count();
             assert_eq!(requests, 2, "{case}: nothing is requested again");
-            let responses = wire.events.iter().filter(|e| matches!(e, Event::Response { .. })).count();
+            let responses = wire
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::Response { .. }))
+                .count();
             assert_eq!(responses, 1, "{case}: only the first block is delivered");
             assert!(body_incomplete(&wire.events, &[1]), "{case}: {:?}", wire.events);
         }
@@ -931,7 +956,9 @@ mod controlled_io_tests {
     #[test]
     fn a_body_whose_blocks_outrun_tracking_fails_its_own_request_without_another() {
         let (wire, mut client) = scripted_client();
-        client.request(&[1], 1, true, &[(11, b"large".to_vec())], vec![]).unwrap();
+        client
+            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![])
+            .unwrap();
         client.poll().unwrap();
         // Each answer skips the block asked for, so every block opens a new
         // received range: libcoap tracks three, and the fourth answer overflows.
@@ -939,21 +966,212 @@ mod controlled_io_tests {
             let request = wire.borrow().written.last().unwrap().clone();
             // ETag 7, Block2 number/M/16, Size2 128.
             let options = [0x41, 7, 0xd1, 6, (number << 4) | 8, 0x51, 128];
-            wire.borrow_mut().inbox.push_back(answer(&request, &options, &[number; 16]));
+            wire.borrow_mut()
+                .inbox
+                .push_back(answer(&request, &options, &[number; 16]));
             client.poll().unwrap();
         }
         client.poll().unwrap();
         let wire = wire.borrow();
         let requests = wire.written.iter().filter(|packet| packet[1] != 0).count();
         assert_eq!(requests, 4, "the request and one continuation per tracked block");
-        let responses = wire.events.iter().filter(|e| matches!(e, Event::Response { .. })).count();
+        let responses = wire
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::Response { .. }))
+            .count();
         assert_eq!(responses, 3, "the overflowing block is not delivered");
         assert!(body_incomplete(&wire.events, &[1]), "{:?}", wire.events);
     }
     #[test]
+    fn outgoing_options_are_not_limited_by_the_receive_option_count() {
+        let (wire, mut client) = scripted_client();
+        let options = vec![(2048, Vec::new()); 129];
+        client.request(&[1], 1, false, &options, Vec::new()).unwrap();
+        let wire = wire.borrow();
+        assert_eq!(wire.written.len(), 1);
+        let packet = &wire.written[0];
+        let mut rest = &packet[4 + usize::from(packet[0] & 15)..];
+        let mut number = 0;
+        let mut received = Vec::new();
+        fn extended(nibble: u8, rest: &mut &[u8]) -> u16 {
+            match nibble {
+                0..=12 => u16::from(nibble),
+                13 => {
+                    let n = 13 + u16::from(rest[0]);
+                    *rest = &rest[1..];
+                    n
+                },
+                14 => {
+                    let n = 269 + u16::from_be_bytes([rest[0], rest[1]]);
+                    *rest = &rest[2..];
+                    n
+                },
+                _ => panic!("invalid option encoding"),
+            }
+        }
+        // Decode RFC 7252 options independently. libcoap may also add its own
+        // Request-Tag; all 129 caller options must follow it without loss.
+        while !rest.is_empty() {
+            let header = rest[0];
+            rest = &rest[1..];
+            number += extended(header >> 4, &mut rest);
+            let length = usize::from(extended(header & 15, &mut rest));
+            let value = rest[..length].to_vec();
+            rest = &rest[length..];
+            if number == 2048 {
+                received.push((number, value));
+            }
+        }
+        assert_eq!(received, options);
+    }
+
+    #[test]
+    fn psk_native_capacity_reaches_the_peer_without_truncation() {
+        use std::net::UdpSocket;
+
+        use crate::crypto::psk::{PskKey, ServerPskContextBuilder};
+        struct Datagram(UdpSocket);
+        impl Callbacks for Datagram {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+                self.0.recv_from(buffer).map(|(n, peer)| (n, Some(peer)))
+            }
+
+            fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize> {
+                self.0.send_to(bytes, peer.unwrap())
+            }
+
+            fn event(&mut self, _: Event) -> bool {
+                true
+            }
+        }
+        for (identity_len, key_len) in [(129, 65), (PSK_IDENTITY_MAXIMUM_BYTES, PSK_KEY_MAXIMUM_BYTES)] {
+            let identity = vec![b'i'; identity_len];
+            let mut key = vec![0x5a; key_len];
+            key[key_len - 1] = 0xa7;
+            let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let peer = reservation.local_addr().unwrap();
+            drop(reservation);
+            let mut server = crate::CoapContext::new().unwrap();
+            // Only an exact identity selects the complete expected key. A
+            // successful Finished verifies that the client used every key byte.
+            server
+                .set_psk_context(
+                    ServerPskContextBuilder::new(PskKey::new(Some("wrong"), vec![0; 16]))
+                        .id_key_provider(vec![PskKey::new(Some(identity.clone()), key.clone())])
+                        .build(),
+                )
+                .unwrap();
+            server.add_endpoint_dtls(peer).unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let mut client = Client::new(
+                peer,
+                false,
+                Security::Psk {
+                    identity: Zeroizing::new(identity),
+                    key: Zeroizing::new(key),
+                    sni: "localhost".into(),
+                },
+                None,
+                Limits {
+                    maximum_pdu: 2048,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 2,
+                    ack_timeout_ms: 1000,
+                },
+                Box::new(Datagram(socket)),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !client.ready() {
+                assert!(std::time::Instant::now() < deadline, "DTLS handshake did not complete");
+                server.do_io(Some(std::time::Duration::from_millis(1))).unwrap();
+                client.poll().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn psk_excess_names_the_native_capacity_before_native_session_creation() {
+        for (identity_len, key_len, expected) in [
+            (
+                PSK_IDENTITY_MAXIMUM_BYTES + 1,
+                1,
+                "PSK identity exceeds native PSK_MAX_IDENTITY_LEN minus its NUL terminator",
+            ),
+            (1, PSK_KEY_MAXIMUM_BYTES + 1, "PSK key exceeds native PSK_MAX_PSK_LEN"),
+        ] {
+            let result = Client::new(
+                "127.0.0.1:5684".parse().unwrap(),
+                false,
+                Security::Psk {
+                    identity: Zeroizing::new(vec![b'i'; identity_len]),
+                    key: Zeroizing::new(vec![0xa7; key_len]),
+                    sni: "localhost".into(),
+                },
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 2,
+                    ack_timeout_ms: 1000,
+                },
+                Box::new(Idle),
+            );
+            assert_eq!(result.err(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn the_supplied_receive_option_limit_still_protects_the_callback() {
+        for count in [129, 130] {
+            let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+            let mut client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                false,
+                Security::None,
+                None,
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 129,
+                    maximum_retransmit: 2,
+                    ack_timeout_ms: 1000,
+                },
+                Box::new(Scripted(wire.clone())),
+            )
+            .unwrap();
+            client.request(&[1], 1, true, &[], Vec::new()).unwrap();
+            let request = wire.borrow().written[0].clone();
+            let mut options = vec![0xe0, 0x06, 0xf3];
+            options.resize(options.len() + count - 1, 0);
+            wire.borrow_mut().inbox.push_back(answer(&request, &options, b"ok"));
+            let result = client.poll();
+            assert_eq!(result.is_ok(), count == 129);
+            assert_eq!(
+                wire.borrow()
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::Response { options, .. }
+                if options.len() == count)),
+                count == 129
+            );
+        }
+    }
+
+    #[test]
     fn psk_accepts_short_nonempty_protocol_keys() {
-        for key in [vec![], b"secretPSK".to_vec(), vec![1; 65]] {
-            let valid = !key.is_empty() && key.len() <= 64;
+        for key in [
+            vec![],
+            vec![1],
+            b"secretPSK".to_vec(),
+            vec![1; 65],
+            vec![1; PSK_KEY_MAXIMUM_BYTES + 1],
+        ] {
+            let valid = !key.is_empty() && key.len() <= PSK_KEY_MAXIMUM_BYTES;
             let result = Client::new(
                 "127.0.0.1:5684".parse().unwrap(),
                 false,
@@ -985,18 +1203,26 @@ mod controlled_io_tests {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
                 use std::io::Read;
                 let n = self.input.read(buffer)?;
-                if n == 0 { return Err(io::ErrorKind::WouldBlock.into()); }
+                if n == 0 {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
                 Ok((n, None))
             }
+
             fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
                 Ok(bytes.len())
             }
+
             fn event(&mut self, event: Event) -> bool {
                 match event {
                     Event::Response { payload, .. } => self.received.set(payload.len()),
-                    Event::Session { code } if code == coap_event_t_COAP_EVENT_TCP_CLOSED as u32
-                        || code == coap_event_t_COAP_EVENT_TCP_FAILED as u32
-                        || code == coap_event_t_COAP_EVENT_SESSION_FAILED as u32 => return false,
+                    Event::Session { code }
+                        if code == coap_event_t_COAP_EVENT_TCP_CLOSED as u32
+                            || code == coap_event_t_COAP_EVENT_TCP_FAILED as u32
+                            || code == coap_event_t_COAP_EVENT_SESSION_FAILED as u32 =>
+                    {
+                        return false
+                    },
                     _ => {},
                 }
                 true
@@ -1013,17 +1239,34 @@ mod controlled_io_tests {
             input.resize(input.len() + payload_size, 0x5a);
             let received = Rc::new(std::cell::Cell::new(0));
             let mut client = Client::new(
-                "127.0.0.1:5683".parse().unwrap(), true, Security::None, None,
-                Limits { maximum_pdu: maximum, maximum_body: maximum,
-                    maximum_options: 128, maximum_retransmit: 2, ack_timeout_ms: 1000 },
-                Box::new(Stream { input: std::io::Cursor::new(input), received: received.clone() }),
-            ).unwrap();
+                "127.0.0.1:5683".parse().unwrap(),
+                true,
+                Security::None,
+                None,
+                Limits {
+                    maximum_pdu: maximum,
+                    maximum_body: maximum,
+                    maximum_options: 128,
+                    maximum_retransmit: 2,
+                    ack_timeout_ms: 1000,
+                },
+                Box::new(Stream {
+                    input: std::io::Cursor::new(input),
+                    received: received.clone(),
+                }),
+            )
+            .unwrap();
             // Register the exchange before its hand-authored response arrives.
             client.request(&[1], 1, false, &[], Vec::new()).unwrap();
             let mut failed = false;
             for _ in 0..(payload_size / 64 + 1024) {
-                if client.poll().is_err() { failed = true; break; }
-                if received.get() != 0 { break; }
+                if client.poll().is_err() {
+                    failed = true;
+                    break;
+                }
+                if received.get() != 0 {
+                    break;
+                }
             }
             if payload_size < maximum {
                 assert!(!failed, "a PDU within the configured maximum must be accepted");

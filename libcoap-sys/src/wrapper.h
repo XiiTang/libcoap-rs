@@ -13,3 +13,13 @@
 #if __has_include(<coap3/coap_defines.h>)
 #include <coap3/coap_defines.h>
 #endif
+
+/* runtime-io always builds the bundled OpenSSL backend. Match the buffer
+ * capacities passed by OpenSSL to libcoap's PSK client callback; libcoap
+ * reserves one identity byte for the terminating NUL (coap_openssl.c).
+ */
+#ifdef LIBCOAP_RS_RUNTIME_IO
+#include <openssl/ssl.h>
+#define COAP_RUNTIME_PSK_IDENTITY_MAXIMUM_BYTES (PSK_MAX_IDENTITY_LEN - 1)
+#define COAP_RUNTIME_PSK_KEY_MAXIMUM_BYTES PSK_MAX_PSK_LEN
+#endif
