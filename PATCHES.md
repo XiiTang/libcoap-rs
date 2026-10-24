@@ -171,3 +171,32 @@ restoring the original sys build script and wrapper. Whole-fork formatting
 also reports the original import ordering in `libcoap/src/context.rs`; changed
 Rust files pass the formatter. These unrelated baseline defects are not repaired
 by this patch. Other supported hosts retain their separate platform gates.
+
+## Rule 20: native OSCORE configuration and replay admission
+
+The owner's 2026-10-24 decision removes the remaining OSCORE quotas from
+`55f1dae`. At `59b54d92`, `libcoap/src/controlled.rs:207` refuses configuration
+above 4,096 bytes or more than 16 replay entries. Neither number is a native
+capacity. The bundled libcoap parser consumes a length-delimited configuration
+(`src/coap_oscore.c:1951-2114`) and grows its recipient array for each entry
+(`:1989-2008`); native context derivation creates each recipient
+(`src/oscore/oscore_context.c:582-589`). The existing
+`coap_context_restore_runtime_replay` walks those native recipients and refuses
+an unknown ID (`src/coap_oscore.c:2343-2361`). This native implementation is the
+precedent; no new API or native patch is needed.
+
+`controlled::Client::new` delegates configuration parsing and each replay
+restore to those APIs. Its OSCORE 40-bit sender-sequence admission check stays,
+as do native configuration errors and unknown-recipient restore failures.
+
+On macOS arm64, both single-test regressions fail at `59b54d92` with
+`invalid OSCORE configuration bound` (exit 101) and pass after this change
+(exit 0). `oscore_configuration_reaches_the_native_parser_without_a_byte_quota`
+first proves native parsing of a configuration above 4,096 bytes using a
+2,048-byte HKDF salt, then proves native key derivation/session creation at the
+last 40-bit sender sequence and refusal at 2^40.
+`oscore_restores_all_configured_native_recipients` restores 17 configured native
+recipients; removing the last recipient still produces the native
+`OSCORE replay restore failed` refusal. The `Client::new` admission path is the
+single configuration/restore check point; it owns the native context/session and
+exposes no alternate controlled-client constructor.

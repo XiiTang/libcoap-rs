@@ -204,7 +204,7 @@ impl Client {
             coap_context_set_runtime_verify(context, Some(verify));
             let mut conf = ptr::null_mut();
             if let Some(oscore) = &oscore {
-                if oscore.configuration.len() > 4096 || oscore.sender_next >= (1u64 << 40) || oscore.replay.len() > 16 {
+                if oscore.sender_next >= (1u64 << 40) {
                     return Err("invalid OSCORE configuration bound");
                 }
                 conf = coap_new_oscore_conf(
@@ -745,6 +745,93 @@ mod controlled_io_tests {
         fn event(&mut self, _: Event) -> bool {
             true
         }
+    }
+    fn oscore_configuration(recipients: u8, salt_bytes: usize) -> Vec<u8> {
+        let mut configuration = format!(
+            "master_secret,hex,\"0102030405060708090a0b0c0d0e0f10\"\nsender_id,hex,\"00\"\nmaster_salt,hex,\"{}\"\n",
+            "ab".repeat(salt_bytes)
+        );
+        for id in 1..=recipients {
+            configuration.push_str(&format!("recipient_id,hex,\"{id:02x}\"\n"));
+        }
+        configuration.into_bytes()
+    }
+    fn oscore_client(oscore: Oscore) -> Result<Client, &'static str> {
+        Client::new(
+            "127.0.0.1:5683".parse().unwrap(),
+            false,
+            Security::None,
+            Some(oscore),
+            Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Idle),
+        )
+    }
+    #[test]
+    fn oscore_configuration_reaches_the_native_parser_without_a_byte_quota() {
+        let configuration = oscore_configuration(1, 2048);
+        assert!(configuration.len() > 4096);
+        ensure_coap_started();
+        unsafe {
+            let conf = coap_new_oscore_conf(
+                coap_str_const_t {
+                    length: configuration.len(),
+                    s: configuration.as_ptr(),
+                },
+                None,
+                ptr::null_mut(),
+                0,
+            );
+            assert!(!conf.is_null(), "the native parser accepts the complete configuration");
+            coap_delete_oscore_conf(conf);
+        }
+        let client = oscore_client(Oscore {
+            configuration: configuration.into(),
+            sender_next: (1u64 << 40) - 1,
+            replay: vec![],
+        })
+        .unwrap();
+        assert!(
+            client.ready(),
+            "native OSCORE key derivation and session creation succeed"
+        );
+        // The sender sequence's actual OSCORE capacity still governs admission.
+        assert_eq!(
+            oscore_client(Oscore {
+                configuration: oscore_configuration(1, 0).into(),
+                sender_next: 1u64 << 40,
+                replay: vec![],
+            })
+            .err(),
+            Some("invalid OSCORE configuration bound")
+        );
+    }
+    #[test]
+    fn oscore_restores_all_configured_native_recipients() {
+        let replay = (1..=17).map(|id| (vec![id], u64::from(id), 3, 0)).collect();
+        let client = oscore_client(Oscore {
+            configuration: oscore_configuration(17, 0).into(),
+            sender_next: 0,
+            replay,
+        })
+        .unwrap();
+        assert!(client.ready());
+        // Each restore must match a native recipient, including the final one;
+        // an unconfigured recipient is still refused by the native restore API.
+        assert_eq!(
+            oscore_client(Oscore {
+                configuration: oscore_configuration(16, 0).into(),
+                sender_next: 0,
+                replay: (1..=17).map(|id| (vec![id], u64::from(id), 3, 0)).collect(),
+            })
+            .err(),
+            Some("OSCORE replay restore failed")
+        );
     }
     #[test]
     fn representable_retransmission_parameters_reach_the_native_session() {
