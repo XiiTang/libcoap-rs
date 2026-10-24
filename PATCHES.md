@@ -107,3 +107,18 @@ and calls the native `coap_calc_timeout` for all 256 random values at each
 boundary, checking the shifted timeout and its millisecond conversion.
 The scoped controlled-I/O run passed, including the existing streamed-body,
 PSK and supplied-I/O regressions. Other supported hosts retain their platform gates.
+
+## Configured PDU capacity (W11d)
+
+The controlled client accepts the native CSM receive domain, 64 through
+u32::MAX bytes, without an independent 16 MiB ceiling. Request options use
+the full configured PDU allowance rather than half of it. The native submodule
+checks supplied-I/O TCP PDUs only against the runtime receive maximum;
+non-supplied-I/O clients retain the compile-time default.
+
+`supplied_tcp_pdu_uses_the_runtime_receive_maximum` supplies independently
+encoded TCP responses: a payload above 8 MiB + 256 bytes within a 9 MiB runtime
+maximum is delivered whole, and one above that maximum ends the native client
+without delivery. The corrected regression fails on the previous native pin
+and passes with this patch on macOS arm64. Boundless additionally tests its
+configured PDU and outgoing option checkpoint.

@@ -142,7 +142,7 @@ impl Client {
         limits: Limits,
         callbacks: Box<dyn Callbacks>,
     ) -> Result<Self, &'static str> {
-        if !(64..=16 * 1024 * 1024).contains(&limits.maximum_pdu)
+        if !(64..=u32::MAX as usize).contains(&limits.maximum_pdu)
             || limits.maximum_body == 0
             || limits.maximum_options > 128
         {
@@ -383,7 +383,7 @@ impl Client {
             return Err("request limits exceeded");
         }
         if options.windows(2).any(|w| w[0].0 > w[1].0)
-            || options.iter().map(|o| o.1.len() + 5).sum::<usize>() > self.state.maximum_pdu / 2
+            || options.iter().map(|o| o.1.len() + 5).sum::<usize>() > self.state.maximum_pdu
         {
             return Err("option limits exceeded");
         }
@@ -973,6 +973,65 @@ mod controlled_io_tests {
                 Box::new(Idle),
             );
             assert_eq!(result.is_ok(), valid);
+        }
+    }
+    #[test]
+    fn supplied_tcp_pdu_uses_the_runtime_receive_maximum() {
+        struct Stream {
+            input: std::io::Cursor<Vec<u8>>,
+            received: Rc<std::cell::Cell<usize>>,
+        }
+        impl Callbacks for Stream {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+                use std::io::Read;
+                let n = self.input.read(buffer)?;
+                if n == 0 { return Err(io::ErrorKind::WouldBlock.into()); }
+                Ok((n, None))
+            }
+            fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn event(&mut self, event: Event) -> bool {
+                match event {
+                    Event::Response { payload, .. } => self.received.set(payload.len()),
+                    Event::Session { code } if code == coap_event_t_COAP_EVENT_TCP_CLOSED as u32
+                        || code == coap_event_t_COAP_EVENT_TCP_FAILED as u32
+                        || code == coap_event_t_COAP_EVENT_SESSION_FAILED as u32 => return false,
+                    _ => {},
+                }
+                true
+            }
+        }
+        let maximum = 9 * 1024 * 1024;
+        for payload_size in [8 * 1024 * 1024 + 512, maximum + 1] {
+            // RFC 8323: CSM, then a 2.05 with token 1 and a payload. The
+            // length field excludes its header, code and token.
+            let mut input = vec![0x00, 0xe1];
+            input.push(0xf1);
+            input.extend_from_slice(&((payload_size + 1 - 65805) as u32).to_be_bytes());
+            input.extend_from_slice(&[69, 1, 0xff]);
+            input.resize(input.len() + payload_size, 0x5a);
+            let received = Rc::new(std::cell::Cell::new(0));
+            let mut client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(), true, Security::None, None,
+                Limits { maximum_pdu: maximum, maximum_body: maximum,
+                    maximum_options: 128, maximum_retransmit: 2, ack_timeout_ms: 1000 },
+                Box::new(Stream { input: std::io::Cursor::new(input), received: received.clone() }),
+            ).unwrap();
+            // Register the exchange before its hand-authored response arrives.
+            client.request(&[1], 1, false, &[], Vec::new()).unwrap();
+            let mut failed = false;
+            for _ in 0..(payload_size / 64 + 1024) {
+                if client.poll().is_err() { failed = true; break; }
+                if received.get() != 0 { break; }
+            }
+            if payload_size < maximum {
+                assert!(!failed, "a PDU within the configured maximum must be accepted");
+                assert_eq!(received.get(), payload_size);
+            } else {
+                assert!(failed, "a PDU above the configured maximum must be refused");
+                assert_eq!(received.get(), 0);
+            }
         }
     }
     #[test]
