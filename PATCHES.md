@@ -200,3 +200,21 @@ recipients; removing the last recipient still produces the native
 `OSCORE replay restore failed` refusal. The `Client::new` admission path is the
 single configuration/restore check point; it owns the native context/session and
 exposes no alternate controlled-client constructor.
+
+## Native CSM behavior (owner decision, 2026-10-24)
+
+Remove `55f1dae`'s unexplained five-second CSM override from
+`libcoap/src/controlled.rs:200` at `330e431`. The native implementation creates
+contexts with its own CSM timer (`src/coap_net.c:707-709`), computes the pending
+CSM wait in its event-loop preparation (`src/coap_io.c:1496-1511`) and processes
+peer CSM in `src/coap_net.c:3780-3855`. `controlled::Client::new` now leaves that
+native behavior intact for every supplied-I/O client. Boundless's own
+establishment bound governs how long its connection setup may wait. No new API,
+native patch or replacement timer is introduced.
+
+On macOS arm64,
+`reliable_client_keeps_the_native_csm_timer_and_accepts_peer_csm` fails before
+removal (exit 101, controlled 5,000 ms versus native 1,000 ms) and passes after
+(exit 0). It compares the controlled context with a freshly created native
+context, checks that `prepare_wait` exposes the native pending CSM deadline,
+and supplies an independently encoded peer CSM that makes `ready()` true.

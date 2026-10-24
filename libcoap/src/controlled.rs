@@ -197,7 +197,6 @@ impl Client {
             }
             coap_context_set_block_mode(context, COAP_BLOCK_USE_LIBCOAP);
             coap_context_set_csm_max_message_size(context, limits.maximum_pdu as u32);
-            coap_context_set_csm_timeout_ms(context, 5000);
             coap_register_response_handler(context, Some(response));
             coap_register_nack_handler(context, Some(nack));
             coap_register_event_handler(context, Some(event));
@@ -970,6 +969,46 @@ mod controlled_io_tests {
         )
         .unwrap();
         (wire, client)
+    }
+    #[test]
+    fn reliable_client_keeps_the_native_csm_timer_and_accepts_peer_csm() {
+        ensure_coap_started();
+        let native_timeout_ms = unsafe {
+            let context = coap_new_context(ptr::null());
+            assert!(!context.is_null());
+            let timeout = coap_context_get_csm_timeout_ms(context);
+            coap_free_context(context);
+            timeout
+        };
+        let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+        let mut client = Client::new(
+            "127.0.0.1:5683".parse().unwrap(),
+            true,
+            Security::None,
+            None,
+            Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Scripted(wire.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { coap_context_get_csm_timeout_ms(client.context) },
+            native_timeout_ms,
+            "the controlled client must inherit the native context's CSM behavior"
+        );
+        assert!(!client.ready());
+        assert!(wire.borrow().written.iter().any(|packet| packet.get(1) == Some(&0xe1)));
+        let wait = client.prepare_wait().unwrap().expect("the native CSM timer is pending");
+        assert!(wait <= std::time::Duration::from_millis(u64::from(native_timeout_ms)));
+        // Independently encoded RFC 8323 CSM: no token, options or payload.
+        wire.borrow_mut().inbox.push_back(vec![0x00, 0xe1]);
+        client.poll().unwrap();
+        assert!(client.ready(), "the peer's CSM establishes the reliable session");
     }
     #[test]
     fn external_wait_preserves_a_silent_peers_retransmission() {
