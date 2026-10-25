@@ -20,10 +20,10 @@ use std::{
 
 use libcoap_sys::{
     coap_add_attr, coap_delete_resource, coap_new_str_const, coap_pdu_t, coap_register_request_handler,
-    coap_resource_get_uri_path, coap_resource_get_userdata, coap_resource_init, coap_resource_notify_observers,
-    coap_resource_set_get_observable, coap_resource_set_mode, coap_resource_set_userdata, coap_resource_t,
-    coap_send_rst, coap_session_t, coap_string_t, COAP_ATTR_FLAGS_RELEASE_NAME, COAP_ATTR_FLAGS_RELEASE_VALUE,
-    COAP_RESOURCE_FLAGS_NOTIFY_CON, COAP_RESOURCE_FLAGS_NOTIFY_NON, COAP_RESOURCE_FLAGS_RELEASE_URI,
+    coap_resource_get_userdata, coap_resource_init, coap_resource_notify_observers, coap_resource_set_get_observable,
+    coap_resource_set_mode, coap_resource_set_userdata, coap_resource_t, coap_send_rst, coap_session_t, coap_string_t,
+    COAP_ATTR_FLAGS_RELEASE_NAME, COAP_ATTR_FLAGS_RELEASE_VALUE, COAP_RESOURCE_FLAGS_NOTIFY_CON,
+    COAP_RESOURCE_FLAGS_NOTIFY_NON, COAP_RESOURCE_FLAGS_RELEASE_URI,
 };
 
 use crate::{
@@ -100,15 +100,6 @@ pub unsafe fn prepare_resource_handler_data<'a, D: Any + ?Sized + Debug>(
 
 /// Trait with functions relating to [CoapResource]s with an unknown data type.
 pub trait UntypedCoapResource: Any + Debug {
-    /// Returns the uri_path this resource responds to.
-    fn uri_path(&self) -> &str;
-    /// Provides a reference to this resource as an [Any] trait object.
-    ///
-    /// You can use the resulting [Any] reference to downcast the resource to its appropriate
-    /// concrete type (if you wish to e.g. change the application data).
-    ///
-    /// If you use unstable Rust, you can use trait upcasting instead (`[value] as Any`).
-    fn as_any(&self) -> &dyn Any;
     /// Attempts to regain exclusive ownership of the inner resource in order to drop it.
     ///
     /// This function is used by the [CoapContext](crate::context::CoapContext) on cleanup to
@@ -283,12 +274,12 @@ impl<D: Any + ?Sized + Debug> CoapResource<D> {
     }
 
     /// Returns the user data associated with this resource.
-    pub fn user_data(&self) -> Ref<D> {
+    pub fn user_data(&self) -> Ref<'_, D> {
         Ref::map(self.inner.borrow(), |v| v.user_data.as_ref())
     }
 
     /// Mutably returns the user data associated with this resource.
-    pub fn user_data_mut(&self) -> RefMut<D> {
+    pub fn user_data_mut(&self) -> RefMut<'_, D> {
         RefMut::map(self.inner.borrow_mut(), |v| v.user_data.as_mut())
     }
 
@@ -317,7 +308,7 @@ impl<D: Any + ?Sized + Debug> CoapResource<D> {
 
     /// Adds an attribute with a name and an optional value to a CoAP resource object.
     pub fn add_attr(&self, name: &str, val: Option<&str>) {
-        let mut inner = self.inner.borrow_mut();
+        let inner = self.inner.borrow_mut();
         // SAFETY: libcoap uses the passed pointers "attr_name" and "attr_val" here.
         // Because of the passed flags, libcoap takes ownership of these pointers.
         // Passing NULL for the value is safe, since libcoap only frees the value, if it's not NULL.
@@ -384,17 +375,6 @@ impl<D: Any + ?Sized + Debug> CoapResource<D> {
 }
 
 impl<D: Any + ?Sized + Debug> UntypedCoapResource for CoapResource<D> {
-    fn uri_path(&self) -> &str {
-        unsafe {
-            let raw_path = coap_resource_get_uri_path(self.inner.borrow().raw_resource);
-            return std::str::from_utf8_unchecked(std::slice::from_raw_parts((*raw_path).s, (*raw_path).length));
-        }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self as &(dyn Any)
-    }
-
     fn drop_inner_exclusive(self: Box<Self>) {
         self.inner.drop_exclusively();
     }

@@ -147,10 +147,10 @@ impl PskKey<'_> {
         // to the correct length of the slice, and the pointer can actually be treated as a mutable
         // pointer.
         let identity = NonNull::new(identity.s as *mut u8)
-            .map(|mut v| unsafe { Box::from_raw(std::slice::from_raw_parts_mut(v.as_mut(), identity.length)) });
+            .map(|v| unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(v.as_ptr(), identity.length)) });
 
         // SAFETY same as above.
-        let data = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(key.s as *mut u8, key.length)) };
+        let data = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(key.s as *mut u8, key.length)) };
         Self {
             identity,
             data,
@@ -202,5 +202,24 @@ impl<T: Into<Box<[u8]>>, U: Into<Box<[u8]>>> From<(T, U)> for PskKey<'static> {
 impl<'a> AsRef<PskKey<'a>> for PskKey<'a> {
     fn as_ref(&self) -> &PskKey<'a> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tooling_behavior_tests {
+    use super::*;
+
+    #[test]
+    fn raw_psk_roundtrip_keeps_absent_empty_and_binary_values() {
+        for identity in [None, Some(vec![]), Some(vec![0, 1, 255])] {
+            for data in [vec![], vec![0, 128, 255]] {
+                let key = PskKey::new(identity.clone(), data.clone());
+                let raw = key.into_raw_cpsk_info();
+                // SAFETY: This raw value was just created above and has no other users.
+                let restored = unsafe { PskKey::from_raw_cpsk_info(raw) };
+                assert_eq!(restored.identity(), identity.as_deref());
+                assert_eq!(restored.data(), data);
+            }
+        }
     }
 }

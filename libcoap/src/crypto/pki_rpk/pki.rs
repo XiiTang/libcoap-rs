@@ -186,15 +186,15 @@ impl<CA: KeyComponent<Pki>, PK: KeyComponent<Pki>, SK: KeyComponent<Pki>> PkiKey
     /// # Parameters
     ///
     /// - `ca_cert`:     The certificate of the CA whose name should be provided to clients when
-    ///                  requesting client certificates.
-    ///                  **Important:** See the section in the struct-level documentation regarding
-    ///                  this field for more information.
+    ///   requesting client certificates.
+    ///   **Important:** See the section in the struct-level documentation regarding
+    ///   this field for more information.
     /// - `public_cert`: The public (signed) certificate of this key.
     /// - `private_key`: The private key.
     /// - `user_pin`:    The PIN that should be used when unlocking a token (for PKCS11 keys stored
-    ///                  on a token, ignored otherwise)
+    ///   on a token, ignored otherwise)
     /// - `asn1_private_key_type`: The type of the private key (only used for DER/ASN.1 encoded
-    ///                  keys).
+    ///   keys).
     pub fn new(
         ca_cert: Option<CA>,
         public_cert: PK,

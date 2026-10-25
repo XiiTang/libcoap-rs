@@ -63,7 +63,7 @@ impl BuildSystem for PkgConfigBuildSystem {
         self.define_info.as_ref().and_then(|v| v.dtls_backend)
     }
 
-    fn version(&self) -> Option<Version> {
+    fn version(&self) -> Option<Version<'_>> {
         Version::from(&self.library.version)
             .map(Some)
             .expect("unable to parse version string obtained from pkg-config")

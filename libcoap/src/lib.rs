@@ -28,8 +28,8 @@
 //! - [ ] Blockwise Transfer
 //!     - [x] Receiving large messages
 //!         - Note: Handled in libcoap by setting `COAP_BLOCK_USE_LIBCOAP|COAP_BLOCK_SINGLE_BODY`.
-//!                 Manually constructing and managing blockwise transfers is currently not in scope
-//!                 for this library.
+//!           Manually constructing and managing blockwise transfers is currently not in scope
+//!           for this library.
 //!     - [x] sending client-side large messages
 //!     - [ ] sending server-side large messages
 //! - [ ] Resource observation

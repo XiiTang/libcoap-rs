@@ -390,6 +390,10 @@ impl CoapRequestCode {
     }
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 impl TryFrom<coap_pdu_code_t> for CoapRequestCode {
     type Error = MessageCodeError;
 
@@ -488,6 +492,10 @@ impl Display for CoapResponseCode {
     }
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 impl TryFrom<coap_pdu_code_t> for CoapResponseCode {
     type Error = MessageCodeError;
 
@@ -524,6 +532,10 @@ impl CoapMessageType {
     }
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 impl From<coap_pdu_type_t> for CoapMessageType {
     fn from(raw_type: coap_pdu_type_t) -> Self {
         FromPrimitive::from_u32(raw_type as u32).expect("unknown PDU type")

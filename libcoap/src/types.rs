@@ -260,6 +260,10 @@ impl From<&coap_address_t> for CoapAddress {
 /// Representation for a URI scheme that can be used in CoAP (proxy) requests.
 #[repr(u32)]
 #[derive(Copy, Clone, FromPrimitive, Debug, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 pub enum CoapUriScheme {
     Coap = coap_uri_scheme_t_COAP_URI_SCHEME_COAP as u32,
     Coaps = coap_uri_scheme_t_COAP_URI_SCHEME_COAPS as u32,
@@ -276,6 +280,10 @@ impl CoapUriScheme {
         COAP_URI_SCHEME_SECURE_MASK & (self as u32) > 0
     }
 
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+    )]
     pub fn from_raw_scheme(scheme: coap_uri_scheme_t) -> CoapUriScheme {
         FromPrimitive::from_u32(scheme as u32).expect("unknown scheme")
     }
@@ -420,7 +428,7 @@ impl CoapUri {
         query: Option<&[u8]>,
     ) -> Result<CoapUri, UriParsingError> {
         let (uri_str, _, _, _) =
-            Self::construct_uri_string_from_parts(scheme, host, port, path.unwrap_or(&[b'/']), query.unwrap_or(&[]))?;
+            Self::construct_uri_string_from_parts(scheme, host, port, path.unwrap_or(b"/"), query.unwrap_or(&[]))?;
         // SAFETY: coap_split_uri is one of the allowed functions.
         unsafe { CoapUri::create_parsed_uri(uri_str, coap_split_uri, false) }
     }
@@ -460,7 +468,7 @@ impl CoapUri {
         query: Option<&[u8]>,
     ) -> Result<CoapUri, UriParsingError> {
         let (uri_str, _, _, _) =
-            Self::construct_uri_string_from_parts(scheme, host, port, path.unwrap_or(&[b'/']), query.unwrap_or(&[]))?;
+            Self::construct_uri_string_from_parts(scheme, host, port, path.unwrap_or(b"/"), query.unwrap_or(&[]))?;
         // SAFETY: coap_split_proxy_uri is one of the allowed functions.
         unsafe { CoapUri::create_parsed_uri(uri_str, coap_split_proxy_uri, true) }
     }
@@ -687,24 +695,21 @@ impl CoapUri {
     pub unsafe fn from_raw_uri(raw_uri: *const coap_uri_t, is_proxy: bool) -> CoapUri {
         // Loosely based on coap_clone_uri.
         assert!(!raw_uri.is_null());
-        let host_slice = (*raw_uri)
-            .host
-            .s
-            .is_null()
-            .then_some(&[] as &[u8])
-            .unwrap_or_else(|| std::slice::from_raw_parts((*raw_uri).host.s, (*raw_uri).host.length));
-        let path_slice = (*raw_uri)
-            .path
-            .s
-            .is_null()
-            .then_some(&[] as &[u8])
-            .unwrap_or_else(|| std::slice::from_raw_parts((*raw_uri).path.s, (*raw_uri).path.length));
-        let query_slice = (*raw_uri)
-            .query
-            .s
-            .is_null()
-            .then_some(&[] as &[u8])
-            .unwrap_or_else(|| std::slice::from_raw_parts((*raw_uri).query.s, (*raw_uri).query.length));
+        let host_slice = if (*raw_uri).host.s.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts((*raw_uri).host.s, (*raw_uri).host.length)
+        };
+        let path_slice = if (*raw_uri).path.s.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts((*raw_uri).path.s, (*raw_uri).path.length)
+        };
+        let query_slice = if (*raw_uri).query.s.is_null() {
+            &[]
+        } else {
+            std::slice::from_raw_parts((*raw_uri).query.s, (*raw_uri).query.length)
+        };
         // Clone the actual URI string.
         let (uri_str_copy, host_pos, path_pos, query_pos) = Self::construct_uri_string_from_parts(
             CoapUriScheme::from_raw_scheme((*raw_uri).scheme),
@@ -885,6 +890,10 @@ impl Display for CoapUri {
 #[repr(u32)]
 #[non_exhaustive]
 #[derive(Copy, Clone, FromPrimitive, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 pub enum CoapProtocol {
     None = coap_proto_t_COAP_PROTO_NONE as u32,
     Udp = coap_proto_t_COAP_PROTO_UDP as u32,
@@ -903,6 +912,10 @@ impl CoapProtocol {
 }
 
 #[doc(hidden)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 impl From<coap_proto_t> for CoapProtocol {
     fn from(raw_proto: coap_proto_t) -> Self {
         <CoapProtocol as FromPrimitive>::from_u32(raw_proto as u32).expect("unknown protocol")

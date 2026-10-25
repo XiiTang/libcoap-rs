@@ -159,7 +159,6 @@ pub trait CoapEventHandler: Debug {
     fn handle_ws_connected(&mut self, session: &mut CoapSession) {}
 
     /// Handle a WebSocket layer closed event.
-
     #[allow(unused_variables)]
     fn handle_ws_closed(&mut self, session: &mut CoapSession) {}
 

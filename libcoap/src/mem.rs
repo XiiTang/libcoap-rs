@@ -179,7 +179,7 @@ impl<D> CoapFfiRcCell<D> {
     ///
     /// # Panics
     /// Panics if borrowing here would violate Rusts aliasing rules.
-    pub fn borrow(&self) -> Ref<D> {
+    pub fn borrow(&self) -> Ref<'_, D> {
         RefCell::borrow(&self.0)
     }
 
@@ -187,7 +187,7 @@ impl<D> CoapFfiRcCell<D> {
     ///
     /// # Panics
     /// Panics if borrowing mutably here would violate Rusts aliasing rules.
-    pub fn borrow_mut(&self) -> RefMut<D> {
+    pub fn borrow_mut(&self) -> RefMut<'_, D> {
         RefCell::borrow_mut(&self.0)
     }
 }

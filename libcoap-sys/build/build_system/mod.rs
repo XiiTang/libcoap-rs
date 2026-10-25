@@ -53,7 +53,7 @@ pub trait BuildSystem {
     ///
     /// It is assumed that after `generate_bindings()` is called, a `None` return value indicates
     /// that compile-time DTLS library detection is unsupported.
-    fn version(&self) -> Option<Version>;
+    fn version(&self) -> Option<Version<'_>>;
 
     /// Generate Rust bindings to the `libcoap` C library that we linked against and return a
     /// `PathBuf` to the generated bindings file to use.

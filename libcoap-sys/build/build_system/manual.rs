@@ -95,7 +95,7 @@ impl BuildSystem for ManualBuildSystem {
         self.define_info.as_ref().and_then(|v| v.dtls_backend)
     }
 
-    fn version(&self) -> Option<Version> {
+    fn version(&self) -> Option<Version<'_>> {
         self.define_info
             .as_ref()
             .and_then(|i| i.version.as_ref().map(|v| Version::from(v.as_str())))

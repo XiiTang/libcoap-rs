@@ -36,9 +36,9 @@ pub fn basic_client_server_request() {
     let req_handle = session.send_request(request).unwrap();
     loop {
         assert!(context.do_io(Some(Duration::from_secs(10))).expect("error during IO") <= Duration::from_secs(10));
-        for response in session.poll_handle(&req_handle) {
+        if let Some(response) = session.poll_handle(&req_handle).next() {
             assert_eq!(response.code(), CoapMessageCode::Response(CoapResponseCode::Content));
-            assert_eq!(response.data().unwrap().as_ref(), "Hello World!".as_bytes());
+            assert_eq!(response.data().unwrap(), "Hello World!".as_bytes());
             server_handle.join().unwrap();
             return;
         }

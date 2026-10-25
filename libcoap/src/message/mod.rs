@@ -287,7 +287,7 @@ pub trait CoapMessageCommon {
     }
 
     /// Returns an iterator over the options contained in this message.
-    fn options_iter(&self) -> Iter<CoapOption> {
+    fn options_iter(&self) -> Iter<'_, CoapOption> {
         self.as_message().options.iter()
     }
 

@@ -115,6 +115,7 @@ pub const PSK_KEY_MAXIMUM_BYTES: usize = COAP_RUNTIME_PSK_KEY_MAXIMUM_BYTES as u
 ///   fits unsigned int (the shifted timeout is below 1_440_000 ticks);
 /// - transmit span/wait, processing delay, RTT and exchange/NON lifetimes fit
 ///   signed int; their millisecond ticks fit the bundled 64-bit coap_tick_t.
+///
 /// The runtime-io build fixes ACK_RANDOM_FACTOR at its native default 1.500,
 /// Q6/8-bit random arithmetic and 1000 ticks/second on its supported hosts.
 pub fn retransmit_ack_timeout_maximum_ms(maximum: u16) -> u32 {
@@ -643,6 +644,10 @@ unsafe extern "C" fn nack(
             s.failed = true;
             return;
         }
+        #[allow(
+            clippy::unnecessary_cast,
+            reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+        )]
         let value = Event::Nack {
             token: if token.length == 0 {
                 vec![]
@@ -657,6 +662,10 @@ unsafe extern "C" fn nack(
         }
     });
 }
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 unsafe extern "C" fn event(session: *mut coap_session_t, code: coap_event_t) -> i32 {
     guarded(data(session), 0, |s| {
         if !s.callbacks.event(Event::Session { code: code as u32 }) {
@@ -1032,6 +1041,10 @@ mod controlled_io_tests {
         }
         client.forget(&token).unwrap();
     }
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+    )]
     fn body_incomplete(events: &[Event], expected: &[u8]) -> bool {
         events.iter().any(|event| {
             matches!(
@@ -1339,6 +1352,10 @@ mod controlled_io_tests {
                 Ok(bytes.len())
             }
 
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+            )]
             fn event(&mut self, event: Event) -> bool {
                 match event {
                     Event::Response { payload, .. } => self.received.set(payload.len()),

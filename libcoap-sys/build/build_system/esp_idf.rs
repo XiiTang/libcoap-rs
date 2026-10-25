@@ -94,7 +94,7 @@ impl BuildSystem for EspIdfBuildSystem {
             .then_some(DtlsBackend::MbedTls)
     }
 
-    fn version(&self) -> Option<Version> {
+    fn version(&self) -> Option<Version<'_>> {
         None
     }
 

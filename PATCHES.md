@@ -218,3 +218,70 @@ removal (exit 101, controlled 5,000 ms versus native 1,000 ms) and passes after
 (exit 0). It compares the controlled context with a freshly created native
 context, checks that `prepare_wait` exposes the native pending CSM deadline,
 and supplies an independently encoded peer CSM that makes `ready()` true.
+
+## Rust 1.97 strict tooling (Boundless #325)
+
+At `9fe6115a9cf4ab5a8f4704e28cad95d3e0aa5671`, the strict Clippy command
+below exits 101 on five hidden `Version` lifetimes in the sys build systems.
+Running the same command without `-- -D warnings` also exits 101: it exposes
+the four integration-test `never_loop` sites and the remaining library/test
+warnings hidden by that first build-script failure. The declared formatter is
+`nightly-2026-01-31` in `devenv.nix`; its check exits 1 on `context.rs` import
+ordering. The issue's separate `controlled.rs` formatting difference does not
+reproduce at this pin. No formatter configuration or lint level is weakened.
+
+Upstream `namib-project/libcoap-rs` main at
+`0dbf5d33eae294cd16ff5111e6d992f087fb0eae` still has the same hidden build-system
+lifetimes, first-response loops, boxed recipient strings, private unused resource
+methods and reference-to-raw-slice conversions. There is no newer upstream fix
+to reuse for these sites. The repair retains the library's existing APIs and
+native conversions:
+
+- Spell the ten borrowed `Version`, `Ref`, `RefMut` and `Iter` lifetimes as `'_`.
+- Replace the four loops that unconditionally return on their first response
+  with `if let Some(...) = ...next()`, keeping both the outer I/O wait and
+  server join. Remove the four no-op response-slice `as_ref()` calls.
+- Remove two unused methods from the private, unexported resource trait and
+  their implementations; this also removes the unnecessary parentheses and
+  return. Remove the unused `mut` on the attribute helper's existing mutable
+  borrow, retaining the borrow kind and its failure behavior.
+- Store OSCORE recipient `String`s directly. Their byte buffers stay in place
+  when the vector grows; duplicate checks, native calls, removal errors and
+  cleanup ordering stay the same.
+- Reconstruct owned PSK boxes with `ptr::slice_from_raw_parts_mut`, retaining
+  the identity's null check and the original lengths and ownership transfer.
+- Use byte-string defaults and explicit lazy null-pointer branches for URI
+  components. Fix doc-list indentation, doc-comment spacing and import ordering.
+
+Two lint classes are portability false positives and have targeted `allow`
+attributes with reasons beside them:
+
+- `clippy::unnecessary_cast`: bindgen emits signed C enums on MSVC and unsigned
+  C enums on this host. Keep the original bit-preserving `as u32` conversions
+  on `CoapSessionState`, `CoapUriScheme`, `CoapProtocol`, their raw decoding
+  methods, request/response/message-type decoding, the controlled NACK/session
+  callbacks and their native-code comparisons in tests. Each attribute covers
+  only the affected enum, conversion implementation, method, helper or local
+  NACK construction; no module-wide allowance is added.
+- `clippy::useless_conversion`: keep the checked block-mode conversion because
+  supported libcoap versions expose either a `u8` or `u32` parameter. The
+  allowance covers only that local conversion and keeps its panic message.
+
+`recipient_growth_keeps_duplicate_and_removal_results` exercises native
+recipient addition/deletion across vector growth, the initial recipient's
+duplicate refusal, and the unchanged no-context, duplicate and missing-recipient
+errors. `raw_psk_roundtrip_keeps_absent_empty_and_binary_values` checks ownership
+round trips for absent, present-empty and binary identities and empty/binary
+keys. The existing UDP, TCP and DTLS integration assertions still check the
+first response and the server's completion. No lock or poisoning path changes.
+
+Validation on macOS arm64, with `CARGO_INCREMENTAL=0` and compilations/tests
+admitted through `build-slot`:
+
+| Command | Before | After |
+| --- | --- | --- |
+| `cargo +1.97.0 clippy -p libcoap-rs --lib --tests --no-default-features --features runtime-io -- -D warnings` | 101 | 0 |
+| `cargo +nightly-2026-01-31 fmt --all --check` | 1 | 0 |
+
+The runtime regression command is `cargo +1.97.0 test -p libcoap-rs
+--no-default-features --features runtime-io --locked -- --test-threads=1`.

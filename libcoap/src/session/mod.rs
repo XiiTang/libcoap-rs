@@ -50,6 +50,10 @@ pub mod server;
 
 /// Representation of the states that a session can be in.
 #[repr(u32)]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits"
+)]
 pub enum CoapSessionState {
     None = coap_session_state_t_COAP_SESSION_STATE_NONE as u32,
     Connecting = coap_session_state_t_COAP_SESSION_STATE_CONNECTING as u32,
