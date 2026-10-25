@@ -253,7 +253,7 @@ native conversions:
 - Use byte-string defaults and explicit lazy null-pointer branches for URI
   components. Fix doc-list indentation, doc-comment spacing and import ordering.
 
-Two lint classes are portability false positives and have targeted `allow`
+One lint class is a portability false positive and has targeted `allow`
 attributes with reasons beside them:
 
 - `clippy::unnecessary_cast`: bindgen emits signed C enums on MSVC and unsigned
@@ -263,9 +263,15 @@ attributes with reasons beside them:
   callbacks and their native-code comparisons in tests. Each attribute covers
   only the affected enum, conversion implementation, method, helper or local
   NACK construction; no module-wide allowance is added.
-- `clippy::useless_conversion`: keep the checked block-mode conversion because
-  supported libcoap versions expose either a `u8` or `u32` parameter. The
-  allowance covers only that local conversion and keeps its panic message.
+
+The block-mode flags pass directly as `u32`; `clippy::useless_conversion` is
+not a portability false positive. The minimum supported native libcoap is
+4.3.5, and 4.3.5, 4.3.5a, 4.3.5b and the ESP-IDF example's locked component
+4.3.5~3 all declare a `uint32_t` block-mode parameter. The `uint8_t` signature
+belongs to 4.3.4, below the supported minimum. Review of `7b5a836` corrected
+the earlier rationale and removed both the redundant checked conversion and
+its local allowance. For supported versions, the identity conversion could
+not fail; passing the same flags directly preserves caller-visible behavior.
 
 `recipient_growth_keeps_duplicate_and_removal_results` exercises native
 recipient addition/deletion across vector growth, the initial recipient's

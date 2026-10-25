@@ -139,14 +139,7 @@ impl<'a> CoapContext<'a> {
         }
         // SAFETY: We checked that raw_context is not null.
         unsafe {
-            #[allow(
-                clippy::useless_conversion,
-                reason = "libcoap versions expose either u8 or u32 block-mode parameters; retain checked conversion"
-            )]
-            let block_mode = (COAP_BLOCK_USE_LIBCOAP | COAP_BLOCK_SINGLE_BODY)
-                .try_into()
-                .expect("coap_context_set_block_mode() flags have invalid type for function");
-            coap_context_set_block_mode(raw_context, block_mode);
+            coap_context_set_block_mode(raw_context, COAP_BLOCK_USE_LIBCOAP | COAP_BLOCK_SINGLE_BODY);
             coap_register_response_handler(raw_context, Some(session_response_handler));
         }
         let inner = CoapLendableFfiRcCell::new(CoapContextInner {
