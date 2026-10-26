@@ -44,8 +44,34 @@ pub trait Callbacks {
         false
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe { Ping, QBlock, ExtendedToken }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target { Application(Vec<u8>), Internal(Probe), Unmatched }
+/// An actual received message and its local target, captured before native side effects.
+/// Only the received-message callback can construct this projection.
+#[derive(Debug)]
+pub struct PeerMessage {
+    message_type: u8,
+    code: u8,
+    message_id: i32,
+    token: Vec<u8>,
+    options: Vec<(u16, Vec<u8>)>,
+    payload: Vec<u8>,
+    target: Target,
+}
+impl PeerMessage {
+    pub fn message_type(&self) -> u8 { self.message_type }
+    pub fn code(&self) -> u8 { self.code }
+    pub fn message_id(&self) -> i32 { self.message_id }
+    pub fn token(&self) -> &[u8] { &self.token }
+    pub fn options(&self) -> &[(u16, Vec<u8>)] { &self.options }
+    pub fn payload(&self) -> &[u8] { &self.payload }
+    pub fn target(&self) -> &Target { &self.target }
+}
 #[derive(Debug)]
 pub enum Event {
+    Received(PeerMessage),
     Response {
         token: Vec<u8>,
         code: u8,
@@ -202,6 +228,7 @@ impl Client {
             coap_register_nack_handler(context, Some(nack));
             coap_register_event_handler(context, Some(event));
             coap_context_set_runtime_verify(context, Some(verify));
+            coap_context_set_runtime_received(context, Some(received));
             let mut conf = ptr::null_mut();
             if let Some(oscore) = &oscore {
                 if oscore.sender_next >= (1u64 << 40) {
@@ -475,6 +502,7 @@ impl Drop for Client {
             coap_register_response_handler(self.context, None);
             coap_register_nack_handler(self.context, None);
             coap_register_event_handler(self.context, None);
+            coap_context_set_runtime_received(self.context, None);
             self.state.failed = true;
             if !self.session.is_null() {
                 coap_session_release(self.session);
@@ -550,17 +578,17 @@ unsafe extern "C" fn write(data: *mut c_void, buffer: *const u8, length: usize, 
 unsafe fn data(session: *mut coap_session_t) -> *mut c_void {
     coap_get_app_data(coap_session_get_context(session))
 }
-unsafe extern "C" fn response(
-    session: *mut coap_session_t,
-    _sent: *const coap_pdu_t,
-    pdu: *const coap_pdu_t,
-    mid: coap_mid_t,
-) -> coap_response_t {
-    guarded(data(session), coap_response_t_COAP_RESPONSE_FAIL, |s| unsafe {
+struct Fields {
+    token: Vec<u8>,
+    options: Vec<(u16, Vec<u8>)>,
+    payload: Vec<u8>,
+    offset: usize,
+    total: usize,
+}
+unsafe fn read_fields(s: &State, pdu: *const coap_pdu_t) -> Option<Fields> {
         let token = coap_pdu_get_token(pdu);
         if token.length > 8 {
-            s.failed = true;
-            return coap_response_t_COAP_RESPONSE_FAIL;
+            return None;
         }
         let mut iterator: coap_opt_iterator_t = std::mem::zeroed();
         coap_option_iterator_init(pdu, &mut iterator, ptr::null());
@@ -574,8 +602,7 @@ unsafe extern "C" fn response(
             let length = coap_opt_length(option) as usize;
             bytes = bytes.saturating_add(length);
             if options.len() >= s.maximum_options || bytes > s.maximum_pdu {
-                s.failed = true;
-                return coap_response_t_COAP_RESPONSE_FAIL;
+                return None;
             }
             options.push((
                 iterator.number,
@@ -586,28 +613,75 @@ unsafe extern "C" fn response(
         let mut body = ptr::null();
         coap_get_data_large(pdu, &mut length, &mut body, &mut offset, &mut total);
         if length > s.maximum_pdu {
-            s.failed = true;
-            return coap_response_t_COAP_RESPONSE_FAIL;
+            return None;
         }
-        let mut block: coap_block_b_t = std::mem::zeroed();
-        let more = coap_get_block_b(session, pdu, COAP_OPTION_BLOCK2 as u16, &mut block) != 0 && block.m() != 0;
-        let value = Event::Response {
-            token: if token.length == 0 {
-                vec![]
-            } else {
+        Some(Fields {
+            token: if token.length == 0 { vec![] } else {
                 std::slice::from_raw_parts(token.s, token.length).to_vec()
             },
-            code: coap_pdu_get_code(pdu) as u8,
-            message_type: coap_pdu_get_type(pdu) as u8,
-            mid,
             options,
-            payload: if length == 0 {
-                Vec::new()
-            } else {
+            payload: if length == 0 { vec![] } else {
                 std::slice::from_raw_parts(body, length).to_vec()
             },
             offset,
             total,
+        })
+}
+unsafe extern "C" fn received(
+    session: *mut coap_session_t,
+    pdu: *const coap_pdu_t,
+    target: coap_runtime_target_t,
+    app_token: *const coap_bin_const_t,
+) {
+    guarded(data(session), (), |s| unsafe {
+        let Some(fields) = read_fields(s, pdu) else { s.failed = true; return; };
+        let target = match target {
+            libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_APPLICATION => {
+                let token = &*app_token;
+                if token.length > 8 { s.failed = true; return; }
+                Target::Application(if token.length == 0 { vec![] } else {
+                    std::slice::from_raw_parts(token.s, token.length).to_vec()
+                })
+            },
+            libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_PING => Target::Internal(Probe::Ping),
+            libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_Q_BLOCK => Target::Internal(Probe::QBlock),
+            libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_EXTENDED_TOKEN => Target::Internal(Probe::ExtendedToken),
+            _ => Target::Unmatched,
+        };
+        let message = PeerMessage {
+            message_type: coap_pdu_get_type(pdu) as u8,
+            code: coap_pdu_get_code(pdu) as u8,
+            message_id: coap_pdu_get_mid(pdu),
+            token: fields.token,
+            options: fields.options,
+            payload: fields.payload,
+            target,
+        };
+        if !s.callbacks.event(Event::Received(message)) { s.failed = true; }
+    });
+}
+unsafe extern "C" fn response(
+    session: *mut coap_session_t,
+    _sent: *const coap_pdu_t,
+    pdu: *const coap_pdu_t,
+    mid: coap_mid_t,
+) -> coap_response_t {
+    guarded(data(session), coap_response_t_COAP_RESPONSE_FAIL, |s| unsafe {
+        let Some(fields) = read_fields(s, pdu) else {
+            s.failed = true;
+            return coap_response_t_COAP_RESPONSE_FAIL;
+        };
+        let mut block: coap_block_b_t = std::mem::zeroed();
+        let more = coap_get_block_b(session, pdu, COAP_OPTION_BLOCK2 as u16, &mut block) != 0 && block.m() != 0;
+        let value = Event::Response {
+            token: fields.token,
+            code: coap_pdu_get_code(pdu) as u8,
+            message_type: coap_pdu_get_type(pdu) as u8,
+            mid,
+            options: fields.options,
+            payload: fields.payload,
+            offset: fields.offset,
+            total: fields.total,
             more,
             peer: CoapAddress::from(&*coap_session_get_addr_remote(session))
                 .to_socket_addrs()
@@ -978,6 +1052,113 @@ mod controlled_io_tests {
         )
         .unwrap();
         (wire, client)
+    }
+    fn reset(request: &[u8]) -> Vec<u8> {
+        vec![0x70, 0, request[2], request[3]]
+    }
+    #[allow(clippy::unnecessary_cast, reason = "bindgen emits signed C enums on MSVC and unsigned C enums elsewhere; preserve the raw bits")]
+    fn assert_reset_then_nack(events: &[Event], token: &[u8], mid: i32) {
+        let index = events.iter().position(|e| matches!(e, Event::Received(_))).unwrap();
+        let Event::Received(message) = &events[index] else { unreachable!() };
+        assert_eq!(message.target(), &Target::Application(token.to_vec()));
+        assert_eq!((message.message_type(), message.code(), message.message_id()), (3, 0, mid));
+        assert!(message.token().is_empty());
+        assert!(message.options().is_empty());
+        assert!(message.payload().is_empty());
+        let Event::Nack { token: nacked, reason, mid: nacked_mid } = &events[index + 1] else {
+            panic!("the received Reset precedes its NACK: {events:?}");
+        };
+        assert_eq!(nacked, token);
+        assert_eq!(*reason, coap_nack_reason_t_COAP_NACK_RST as u32);
+        assert_eq!(*nacked_mid, mid);
+    }
+    #[test]
+    fn a_reset_names_the_request_it_answers_before_its_nack() {
+        let (wire, mut client) = scripted_client();
+        let token = [0x71];
+        client.request(&token, 1, true, &[], vec![]).unwrap();
+        client.poll().unwrap();
+        let sent = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut().inbox.push_back(reset(&sent));
+        client.poll().unwrap();
+        assert_reset_then_nack(&wire.borrow().events, &token, i32::from(u16::from_be_bytes([sent[2], sent[3]])));
+    }
+    #[test]
+    fn a_reset_of_a_later_block2_block_names_the_application_token() {
+        let (wire, mut client) = scripted_client();
+        let token = [0x71];
+        client.request(&token, 1, true, &[], vec![]).unwrap();
+        let first = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut().inbox.push_back(answer(&first, &[0xd1, 0x0a, 0x08], &[b'a';16]));
+        client.poll().unwrap();
+        let next = wire.borrow().written.last().unwrap().clone();
+        assert_ne!(&next[4..4 + usize::from(next[0] & 15)], &token);
+        wire.borrow_mut().events.clear();
+        wire.borrow_mut().inbox.push_back(reset(&next));
+        client.poll().unwrap();
+        assert_reset_then_nack(&wire.borrow().events, &token, i32::from(u16::from_be_bytes([next[2], next[3]])));
+    }
+    // Reads the test's outgoing Block1 option to echo the actual block size.
+    fn block1(packet: &[u8]) -> Vec<u8> {
+        let mut cursor = 4 + usize::from(packet[0] & 15);
+        let mut number = 0usize;
+        fn extended(packet: &[u8], cursor: &mut usize, nibble: u8) -> usize {
+            match nibble {
+                0..=12 => usize::from(nibble),
+                13 => { let n = usize::from(packet[*cursor]) + 13; *cursor += 1; n },
+                14 => { let n = usize::from(u16::from_be_bytes([packet[*cursor],packet[*cursor+1]])) + 269; *cursor += 2; n },
+                _ => panic!("invalid option"),
+            }
+        }
+        while cursor < packet.len() && packet[cursor] != 0xff {
+            let header = packet[cursor]; cursor += 1;
+            number += extended(packet, &mut cursor, header >> 4);
+            let length = extended(packet, &mut cursor, header & 15);
+            let value = &packet[cursor..cursor+length]; cursor += length;
+            if number == 27 { return value.to_vec(); }
+        }
+        panic!("no Block1 option");
+    }
+    #[test]
+    fn a_reset_of_a_later_block1_block_names_the_application_token() {
+        let (wire, mut client) = scripted_client();
+        let token = [0x71];
+        client.request(&token, 3, true, &[], vec![b'a';2048]).unwrap();
+        let first = wire.borrow().written.last().unwrap().clone();
+        let block = block1(&first);
+        let mut options = vec![0xd0 | block.len() as u8, 14];
+        options.extend(block);
+        let mut continued = answer(&first, &options, &[]);
+        continued[1] = 95;
+        continued.pop(); // no payload marker on the empty 2.31
+        wire.borrow_mut().inbox.push_back(continued);
+        client.poll().unwrap();
+        let next = wire.borrow().written.last().unwrap().clone();
+        assert_ne!(&next[2..4], &first[2..4]);
+        wire.borrow_mut().events.clear();
+        wire.borrow_mut().inbox.push_back(reset(&next));
+        client.poll().unwrap();
+        assert_reset_then_nack(&wire.borrow().events, &token, i32::from(u16::from_be_bytes([next[2], next[3]])));
+    }
+    #[test]
+    fn an_unknown_reset_names_no_request() {
+        let (wire, mut client) = scripted_client();
+        let token = [0x71];
+        client.request(&token, 1, true, &[], vec![]).unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        let unknown = u16::from_be_bytes([request[2], request[3]]).wrapping_add(1).to_be_bytes();
+        wire.borrow_mut().inbox.push_back(vec![0x70, 0, unknown[0], unknown[1]]);
+        client.poll().unwrap();
+        {
+            let wire = wire.borrow();
+            let index = wire.events.iter().position(|e| matches!(e, Event::Received(_))).unwrap();
+            let Event::Received(message) = &wire.events[index] else { unreachable!() };
+            assert_eq!(message.target(), &Target::Unmatched);
+            assert!(matches!(&wire.events[index+1], Event::Nack { token, .. } if token.is_empty()));
+        }
+        wire.borrow_mut().inbox.push_back(answer(&request, &[], b"ok"));
+        client.poll().unwrap();
+        assert!(wire.borrow().events.iter().any(|e| matches!(e, Event::Response { token: actual, payload, .. } if actual == &token && payload == b"ok")));
     }
     #[test]
     fn reliable_client_keeps_the_native_csm_timer_and_accepts_peer_csm() {

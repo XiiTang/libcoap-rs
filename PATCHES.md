@@ -291,3 +291,23 @@ admitted through `build-slot`:
 
 The runtime regression command is `cargo +1.97.0 test -p libcoap-rs
 --no-default-features --features runtime-io --locked -- --test-threads=1`.
+
+## Received Reset target (W5-D7)
+
+`controlled::Event::Received(PeerMessage)` reports an actual received datagram
+Reset before libcoap changes its native state. `PeerMessage` has private fields,
+no setters, and a single constructor in the native received callback. Read-only
+getters expose the received type, code, MID, token, options and payload, separately
+from `Target::Application(app_token)`, `Internal(Probe)` or `Unmatched`.
+The response and received callbacks share one bounded field parser. Registration
+is removed before context destruction, like the other controlled handlers.
+
+The native submodule is `c859ba15ac9e42944e746f21c4d4c29aea151cbb`;
+its shared resolver restores the application token of later Block1/Block2 PDUs
+without treating the sent PDU as peer evidence. The supplied-I/O regressions
+`a_reset_names_the_request_it_answers_before_its_nack`,
+`a_reset_of_a_later_block2_block_names_the_application_token`,
+`a_reset_of_a_later_block1_block_names_the_application_token` and
+`an_unknown_reset_names_no_request` pass on macOS arm64, as does the complete
+Rust package suite with `--no-default-features --features runtime-io`, including
+doctests. Native CUnit coverage is recorded in its own PATCHES.md.
