@@ -503,7 +503,6 @@ impl Drop for Client {
             coap_register_nack_handler(self.context, None);
             coap_register_event_handler(self.context, None);
             coap_context_set_runtime_received(self.context, None);
-            self.state.failed = true;
             if !self.session.is_null() {
                 coap_session_release(self.session);
             }
@@ -1410,6 +1409,97 @@ mod controlled_io_tests {
                 server.do_io(Some(std::time::Duration::from_millis(1))).unwrap();
                 client.poll().unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn drop_sends_native_close_notify_to_the_dtls_peer() {
+        use std::net::UdpSocket;
+        struct Server(*mut coap_context_t);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                unsafe { coap_free_context(self.0) }
+            }
+        }
+        unsafe extern "C" fn closed(session: *mut coap_session_t, event: coap_event_t) -> i32 {
+            if event == coap_event_t_COAP_EVENT_DTLS_CLOSED {
+                let data = unsafe { coap_get_app_data(coap_session_get_context(session)) };
+                unsafe {
+                    (*data.cast::<std::cell::Cell<bool>>()).set(true);
+                }
+            }
+            0
+        }
+        struct Datagram(UdpSocket);
+        impl Callbacks for Datagram {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+                self.0.recv_from(buffer).map(|(n, peer)| (n, Some(peer)))
+            }
+            fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize> {
+                self.0.send_to(bytes, peer.unwrap())
+            }
+            fn event(&mut self, _: Event) -> bool {
+                true
+            }
+        }
+        ensure_coap_started();
+        let reservation = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = reservation.local_addr().unwrap();
+        drop(reservation);
+        let received_close = std::cell::Cell::new(false);
+        let server = Server(unsafe { coap_new_context(ptr::null()) });
+        assert!(!server.0.is_null());
+        unsafe {
+            coap_set_app_data(
+                server.0,
+                (&received_close as *const std::cell::Cell<bool>).cast_mut().cast(),
+            );
+            coap_register_event_handler(server.0, Some(closed));
+            assert_eq!(
+                coap_context_set_psk(server.0, c"hint".as_ptr(), b"secretPSK".as_ptr(), 9),
+                1
+            );
+            assert!(!coap_new_endpoint(
+                server.0,
+                CoapAddress::from(peer).as_raw_address(),
+                coap_proto_t_COAP_PROTO_DTLS
+            )
+            .is_null());
+        }
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut client = Client::new(
+            peer,
+            false,
+            Security::Psk {
+                identity: Zeroizing::new(b"fixture".to_vec()),
+                key: Zeroizing::new(b"secretPSK".to_vec()),
+                sni: "localhost".into(),
+            },
+            None,
+            Limits {
+                maximum_pdu: 2048,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 2,
+                ack_timeout_ms: 1000,
+            },
+            Box::new(Datagram(socket)),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !client.ready() {
+            assert!(std::time::Instant::now() < deadline, "DTLS handshake did not complete");
+            assert!(unsafe { coap_io_process(server.0, 1) } >= 0);
+            client.poll().unwrap();
+        }
+        drop(client);
+        while !received_close.get() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer did not receive DTLS close_notify"
+            );
+            assert!(unsafe { coap_io_process(server.0, 1) } >= 0);
         }
     }
 

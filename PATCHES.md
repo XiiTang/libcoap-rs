@@ -311,3 +311,35 @@ without treating the sent PDU as peer evidence. The supplied-I/O regressions
 `an_unknown_reset_names_no_request` pass on macOS arm64, as does the complete
 Rust package suite with `--no-default-features --features runtime-io`, including
 doctests. Native CUnit coverage is recorded in its own PATCHES.md.
+
+
+## Preserve native teardown output (F7)
+
+Start from upstream 0dbf5d33 `libcoap/src/session/client.rs`'s
+`CoapClientSessionInner::drop`: disable callbacks that access a partially dropped
+session, then release it while native I/O remains usable. The supplied-I/O Client
+keeps those callback removals and no longer marks an otherwise healthy I/O state
+failed before releasing the session/context. libcoap's upstream OpenSSL
+`coap_dtls_free_session` owns SSL_shutdown and its close_notify write. No different
+teardown policy is needed. An already failed callback state stays failed, retaining
+the recorded panic/error boundary.
+
+Regression: `drop_sends_native_close_notify_to_the_dtls_peer` drives a real
+DTLS handshake and client Drop, then waits for the server's DTLS-closed event:
+its peer must receive and decrypt the native close_notify.
+
+## Native CSM fallback (F8)
+
+The libcoap gitlink includes the native `coap_client_delay_first` restoration
+to upstream 851533c3: supplied I/O keeps csm_not_seen fallback when a direct
+pre-ready request reaches the CSM timeout. No differing policy is required.
+The native PATCHES.md names the CUnit request-path regression and its result.
+
+On macOS arm64 with consumer Rust 1.97.0, the consumer-feature package suite
+(`--no-default-features --features runtime-io`, single test thread) and strict
+lib/tests Clippy pass, including the peer-observed close_notify regression.
+Workspace/default feature aggregation requests native features deliberately
+disabled by runtime-io and cannot build that combination. Stable workspace fmt
+reports existing unformatted received-Reset code outside this change; the new
+regression is formatted and unrelated formatting is left untouched to keep the
+upstream restoration minimal.
