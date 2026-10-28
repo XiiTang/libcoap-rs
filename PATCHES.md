@@ -343,3 +343,25 @@ disabled by runtime-io and cannot build that combination. Stable workspace fmt
 reports existing unformatted received-Reset code outside this change; the new
 regression is formatted and unrelated formatting is left untouched to keep the
 upstream restoration minimal.
+
+## Consumer native-I/O admission during normal close (review B F7)
+
+The upstream source remains 0dbf5d33 `session/client.rs:283-311`: native
+release may perform I/O after semantic callbacks are disabled. The controlled
+client keeps that release and its existing error/panic latch unchanged.
+`controlled::write` maps WouldBlock to a native retry indication, while a
+real error or panic latches failure; returning WouldBlock from a final Drop
+write cannot cause a later poll after native state is freed. A supplied
+consumer must therefore keep healthy native I/O usable during a normal-close
+race, and admit final-release output to its bounded pump before release
+returns. Boundless now does both at Adapter::write: command admission remains
+closed, normal native writes stay nonfatal, and only final release waits for
+bounded capacity, subject to inherited cancellation/deadline and pump failure.
+There is no additional fork runtime mechanism or native retry policy.
+
+Boundless's gated, real OpenSSL DTLS regressions close while a native timer
+retransmission is about to write, and while the pump is held with all sixteen
+output slots full during real native release. Both require the peer's decrypted
+close_notify, the original Program end and native-owner/pump joins. They fail
+on the reviewed consumer before its correction. The fork's healthy-Drop peer
+regression and real error/panic latching remain unchanged.
