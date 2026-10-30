@@ -47,7 +47,7 @@ pub trait Callbacks {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe { Ping, QBlock, ExtendedToken }
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target { Application(Vec<u8>), Internal(Probe), Unmatched }
+pub enum Target { Application(Vec<u8>), Internal(Probe), Unmatched, Session }
 /// An actual received message and its local target, captured before native side effects.
 /// Only the received-message callback can construct this projection.
 #[derive(Debug)]
@@ -59,6 +59,7 @@ pub struct PeerMessage {
     options: Vec<(u16, Vec<u8>)>,
     payload: Vec<u8>,
     target: Target,
+    peer: SocketAddr,
 }
 impl PeerMessage {
     pub fn message_type(&self) -> u8 { self.message_type }
@@ -68,6 +69,10 @@ impl PeerMessage {
     pub fn options(&self) -> &[(u16, Vec<u8>)] { &self.options }
     pub fn payload(&self) -> &[u8] { &self.payload }
     pub fn target(&self) -> &Target { &self.target }
+    /// The native remote-address snapshot at receipt. With supplied I/O this
+    /// can be an endpoint label or a SOCKS relay; the transport owner decides
+    /// whether it is an observed target peer before using it as evidence.
+    pub fn peer(&self) -> SocketAddr { self.peer }
 }
 #[derive(Debug)]
 pub enum Event {
@@ -645,6 +650,7 @@ unsafe extern "C" fn received(
             libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_PING => Target::Internal(Probe::Ping),
             libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_Q_BLOCK => Target::Internal(Probe::QBlock),
             libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_EXTENDED_TOKEN => Target::Internal(Probe::ExtendedToken),
+            libcoap_sys::coap_runtime_target_t_COAP_RUNTIME_TARGET_SESSION => Target::Session,
             _ => Target::Unmatched,
         };
         let message = PeerMessage {
@@ -655,6 +661,8 @@ unsafe extern "C" fn received(
             options: fields.options,
             payload: fields.payload,
             target,
+            peer: CoapAddress::from(&*coap_session_get_addr_remote(session))
+                .to_socket_addrs().unwrap().next().unwrap(),
         };
         if !s.callbacks.event(Event::Received(message)) { s.failed = true; }
     });
@@ -1601,6 +1609,68 @@ mod controlled_io_tests {
                 Box::new(Idle),
             );
             assert_eq!(result.is_ok(), valid);
+        }
+    }
+    #[test]
+    #[allow(clippy::unnecessary_cast, reason = "bindgen C enums differ on MSVC")]
+    fn received_signaling_keeps_fields_and_peer_before_native_disconnect() {
+        struct Stream(Rc<std::cell::RefCell<Wire>>);
+        impl Callbacks for Stream {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+                let bytes = self.0.borrow_mut().inbox.pop_front().ok_or(io::ErrorKind::WouldBlock)?;
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok((bytes.len(), None))
+            }
+            fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
+                self.0.borrow_mut().written.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn event(&mut self, event: Event) -> bool {
+                self.0.borrow_mut().events.push(event);
+                true
+            }
+        }
+        for code in [0xe4, 0xe5] {
+            for pending in [false, true] {
+                let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+                let peer = "127.0.0.1:5683".parse().unwrap();
+                let mut client = Client::new(peer, true, Security::None, None,
+                    Limits { maximum_pdu: 1024, maximum_body: 4096,
+                        maximum_options: 128, maximum_retransmit: 2, ack_timeout_ms: 1000 },
+                    Box::new(Stream(wire.clone()))).unwrap();
+                wire.borrow_mut().inbox.push_back(vec![0x00, 0xe1]);
+                client.poll().unwrap();
+                assert!(client.ready());
+                if pending {
+                    client.request(&[0x71], 1, true, &[], vec![]).unwrap();
+                    client.request(&[0x72], 1, true, &[], vec![]).unwrap();
+                }
+                wire.borrow_mut().events.clear();
+                // RFC 8323 length excludes code/token: raw option 2, raw option 4,
+                // then payload. Option 4 is a signaling option, not an ETag.
+                wire.borrow_mut().inbox.push_back(vec![0x70, code, 0x21, 7, 0x21, 9, 0xff, b'o', b'k']);
+                client.poll().unwrap();
+                let wire = wire.borrow();
+                let Event::Received(message) = &wire.events[0] else { panic!("{:#?}", wire.events) };
+                assert_eq!(message.target(), &Target::Session);
+                assert_eq!(message.peer(), peer);
+                assert_eq!(message.code(), code);
+                assert!(message.token().is_empty());
+                assert_eq!(message.options(), &[(2, vec![7]), (4, vec![9])]);
+                assert_eq!(message.payload(), b"ok");
+                if pending {
+                    let nacks = wire.events.iter().filter_map(|event| match event {
+                        Event::Nack { token, reason, .. } => {
+                            assert_eq!(*reason, coap_nack_reason_t_COAP_NACK_RST as u32);
+                            Some(token.clone())
+                        }
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    assert!(!nacks.is_empty());
+                    assert!(nacks.iter().all(|token| token == &[0x71] || token == &[0x72]));
+                }
+                assert!(!client.ready());
+            }
         }
     }
     #[test]

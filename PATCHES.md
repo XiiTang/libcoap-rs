@@ -1,7 +1,7 @@
 # Runtime client binding
 
 Base: namib-project/libcoap-rs `0dbf5d33eae294cd16ff5111e6d992f087fb0eae`.
-The libcoap submodule pins the controlled-runtime fork of upstream v4.3.5b (`d23c588856e21a53573719070e5e7ceb46fc8ccb`).
+The libcoap submodule pins the controlled-runtime fork of upstream v4.3.5b (`851533c3`). `d23c588856e21a53573719070e5e7ceb46fc8ccb` is fork history, not the upstream basis.
 Both repositories retain their upstream BSD licenses and history.
 
 `runtime-io` adds `controlled::Client`: one !Send context/session owner, supplied
@@ -365,3 +365,19 @@ output slots full during real native release. Both require the peer's decrypted
 close_notify, the original Program end and native-owner/pump joins. They fail
 on the reviewed consumer before its correction. The fork's healthy-Drop peer
 regression and real error/panic latching remain unchanged.
+
+## Received reliable ending messages (W5-D7 remainder)
+
+Upstream libcoap `851533c3::handle_signaling` discards Release/Abort fields at
+disconnect; its public handlers do not expose that PDU. `d23c5888` is fork
+history, not the upstream basis. The native patch invokes the existing
+received hook before the unchanged disconnect. The controlled projection adds
+`Target::Session` and `PeerMessage::peer()` from the actual native remote
+address at the sole received constructor, using the existing field reader.
+No sent PDU or alternate parser becomes peer evidence.
+
+`received_signaling_keeps_fields_and_peer_before_native_disconnect` supplies
+independently encoded Release/Abort, with zero and two outstanding requests,
+and checks exact raw fields, peer, the hook before native NACKs and the actual
+disconnect. Existing later Block1/2 Reset/probe/collision behavior is retained.
+Validation results are recorded after running these regressions.
