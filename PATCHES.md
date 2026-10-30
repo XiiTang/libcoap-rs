@@ -380,4 +380,10 @@ No sent PDU or alternate parser becomes peer evidence.
 independently encoded Release/Abort, with zero and two outstanding requests,
 and checks exact raw fields, peer, the hook before native NACKs and the actual
 disconnect. Existing later Block1/2 Reset/probe/collision behavior is retained.
-Validation results are recorded after running these regressions.
+Validation: macOS arm64, all 21 controlled-I/O regressions pass, including
+zero/two-pending Release/Abort, later Block1/Block2 Reset resolution, healthy
+Drop, native timer and real error/panic latching. Strict Clippy of libcoap-rs
+(`--lib --tests`, runtime-io) passes. Native checkpoint sensitivity is recorded
+in the submodule PATCHES.md. The native peer getter is a snapshot: supplied
+stream labels and routed datagram relay addresses are not necessarily observed
+target peers; the embedding transport owner decides whether to publish it.
