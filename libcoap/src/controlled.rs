@@ -1231,6 +1231,52 @@ mod controlled_io_tests {
         );
     }
     #[test]
+    fn a_multicast_non_reset_keeps_its_individual_source_snapshot() {
+        let group: SocketAddr = "239.255.0.1:5683".parse().unwrap();
+        let source: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+        let mut client = Client::new(
+            group,
+            false,
+            Security::None,
+            None,
+            Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Scripted(wire.clone())),
+        )
+        .unwrap();
+        client.request(&[0x71], 1, false, &[], vec![]).unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        assert_eq!((request[0] >> 4) & 3, 1);
+        wire.borrow_mut().inbox.push_back(reset(&request));
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        let message = wire
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Received(message) => Some(message),
+                _ => None,
+            })
+            .expect("the native received hook observes the Reset");
+        assert_eq!(message.target(), &Target::Unmatched);
+        assert_eq!(message.peer(), source);
+        assert_ne!(message.peer(), group);
+        assert_eq!((message.message_type(), message.code()), (3, 0));
+        assert_eq!(
+            message.message_id(),
+            i32::from(u16::from_be_bytes([request[2], request[3]]))
+        );
+        assert!(message.token().is_empty());
+        assert!(message.options().is_empty());
+        assert!(message.payload().is_empty());
+    }
+    #[test]
     fn an_unknown_reset_names_no_request() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];

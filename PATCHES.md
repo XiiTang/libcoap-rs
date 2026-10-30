@@ -387,3 +387,17 @@ Drop, native timer and real error/panic latching. Strict Clippy of libcoap-rs
 in the submodule PATCHES.md. The native peer getter is a snapshot: supplied
 stream labels and routed datagram relay addresses are not necessarily observed
 target peers; the embedding transport owner decides whether to publish it.
+
+## Multicast received-source acceptance (W5-D7 amendment)
+
+`a_multicast_non_reset_keeps_its_individual_source_snapshot` sends an actual
+native NON request to a multicast group through supplied I/O, then supplies a
+Reset from an individual source. The existing native received hook reports
+that source in the immutable `PeerMessage`, distinct from the group address.
+The target remains Unmatched: `coap_runtime_classify_rst` resolves Application
+only from a queued CON, and multicast requests and their Block2 copies are NON.
+No NON correlation or adapter publication path is added. This replaces the
+consumer's impossible published-multicast-Reset acceptance assertion.
+
+Validation: macOS arm64, the focused native multicast hook regression passes;
+combined libcoap-rs/libcoap-sys strict lib/test Clippy passes.
