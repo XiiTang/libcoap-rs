@@ -401,3 +401,18 @@ consumer's impossible published-multicast-Reset acceptance assertion.
 
 Validation: macOS arm64, the focused native multicast hook regression passes;
 combined libcoap-rs/libcoap-sys strict lib/test Clippy passes.
+
+## BSD socket lengths in sys test fixtures
+
+The sys-only `tests::coap_address_from_socketaddr` helper initialized libc
+`sockaddr_in` and `sockaddr_in6` without their BSD length fields. On macOS
+arm64 the combined binding/sys `--lib --tests` Clippy check failed with E0063
+for `sin_len` and `sin6_len`, before checking or running the test target.
+Use the same conditional length initialization as the existing production
+`CoapAddress::from` conversion in `libcoap/src/types.rs`. Both test address
+families pass through this one helper. Production address conversion and the
+native submodule are unchanged. This is a separate test portability repair.
+
+Validation: macOS arm64, combined libcoap-rs/libcoap-sys strict lib/test Clippy
+passes, and the repaired helper runs the native client/server exchange
+(`tests::test_coap_client_server_basic`) successfully.

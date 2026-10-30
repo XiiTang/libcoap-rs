@@ -546,6 +546,19 @@ mod tests {
                         addr: std::mem::zeroed(),
                     };
                     coap_addr.addr.sin = sockaddr_in {
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "freebsd",
+                            target_os = "dragonfly",
+                            target_os = "openbsd",
+                            target_os = "netbsd",
+                            target_os = "aix",
+                            target_os = "haiku",
+                            target_os = "hurd",
+                            target_os = "espidf",
+                        ))]
+                        sin_len: (std::mem::size_of::<sockaddr_in>() as u8),
                         sin_family: AF_INET as sa_family_t,
                         sin_port: addr.port().to_be(),
                         sin_addr: in_addr {
@@ -566,6 +579,19 @@ mod tests {
                         addr: std::mem::zeroed(),
                     };
                     coap_addr.addr.sin6 = sockaddr_in6 {
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "freebsd",
+                            target_os = "dragonfly",
+                            target_os = "openbsd",
+                            target_os = "netbsd",
+                            target_os = "aix",
+                            target_os = "haiku",
+                            target_os = "hurd",
+                            target_os = "espidf",
+                        ))]
+                        sin6_len: (std::mem::size_of::<sockaddr_in6>() as u8),
                         sin6_family: AF_INET6 as sa_family_t,
                         sin6_port: addr.port().to_be(),
                         sin6_addr: in6_addr {
