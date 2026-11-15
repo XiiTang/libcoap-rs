@@ -440,6 +440,13 @@ impl Client {
         Ok((milliseconds != 0).then_some(std::time::Duration::from_millis(u64::from(milliseconds))))
     }
 
+    /// The largest request PDU the session transmits, excluding the fixed
+    /// header: the transmit MTU (the peer's CSM Max-Message-Size on a reliable
+    /// session) less any DTLS overhead, as `coap_session_max_pdu_size` answers.
+    pub fn transmit_pdu_maximum(&self) -> usize {
+        unsafe { coap_session_max_pdu_size(self.session) }
+    }
+
     pub fn request(
         &mut self,
         token: &[u8],
@@ -452,13 +459,16 @@ impl Client {
         if token.is_empty() || token.len() > 8 || !(1..=7).contains(&code) || payload.len() > self.maximum_body {
             return Err("request limits exceeded");
         }
-        if options.windows(2).any(|w| w[0].0 > w[1].0)
-            || options.iter().map(|o| o.1.len() + 5).sum::<usize>() > self.state.maximum_pdu
+        let maximum = self.transmit_pdu_maximum();
+        if options.windows(2).any(|w| w[0].0 > w[1].0) || options.iter().map(|o| o.1.len() + 5).sum::<usize>() > maximum
         {
             return Err("option limits exceeded");
         }
         unsafe {
             coap_session_set_runtime_peer(self.session, CoapAddress::from(self.peer).as_raw_address());
+            // Size the request as upstream `coap_new_pdu` does: libcoap splits a
+            // body into Block1 only beyond this size, so a receive maximum here
+            // would send any smaller body as one oversized message.
             let pdu = coap_pdu_init(
                 if confirmable {
                     coap_pdu_type_t_COAP_MESSAGE_CON
@@ -467,7 +477,7 @@ impl Client {
                 },
                 code.into(),
                 i32::from(coap_new_message_id(self.session)),
-                self.state.maximum_pdu,
+                maximum,
             );
             if pdu.is_null() {
                 return Err("request allocation failed");
@@ -1830,6 +1840,101 @@ mod controlled_io_tests {
                 assert!(!client.ready());
             }
         }
+    }
+    /// RFC 7252 options of `packet` and its payload, decoded independently.
+    fn decoded(packet: &[u8]) -> (Vec<(u16, Vec<u8>)>, Vec<u8>) {
+        fn extended(nibble: u8, rest: &mut &[u8]) -> u16 {
+            match nibble {
+                0..=12 => u16::from(nibble),
+                13 => {
+                    let n = 13 + u16::from(rest[0]);
+                    *rest = &rest[1..];
+                    n
+                },
+                14 => {
+                    let n = 269 + u16::from_be_bytes([rest[0], rest[1]]);
+                    *rest = &rest[2..];
+                    n
+                },
+                _ => panic!("invalid option encoding"),
+            }
+        }
+        let mut rest = &packet[4 + usize::from(packet[0] & 15)..];
+        let mut number = 0;
+        let mut options = Vec::new();
+        while let Some(&header) = rest.first() {
+            rest = &rest[1..];
+            if header == 0xff {
+                return (options, rest.to_vec());
+            }
+            number += extended(header >> 4, &mut rest);
+            let length = usize::from(extended(header & 15, &mut rest));
+            options.push((number, rest[..length].to_vec()));
+            rest = &rest[length..];
+        }
+        (options, Vec::new())
+    }
+    #[test]
+    fn a_request_body_above_the_transmit_mtu_is_sent_as_block1_under_a_larger_receive_maximum() {
+        let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+        let mut client = Client::new(
+            "127.0.0.1:5683".parse().unwrap(),
+            false,
+            Security::None,
+            None,
+            Limits {
+                maximum_pdu: 65507,
+                maximum_body: 65536,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Scripted(wire.clone())),
+        )
+        .unwrap();
+        let mtu = client.transmit_pdu_maximum();
+        assert!(mtu < 4000, "the native default transmit MTU: {mtu}");
+        let body = (0..=255u8).cycle().take(4000).collect::<Vec<_>>();
+        client.request(&[0x71], 3, true, &[], body.clone()).unwrap();
+        let mut received = Vec::new();
+        for _ in 0..64 {
+            client.poll().unwrap();
+            let Some(sent) = wire.borrow_mut().written.pop() else {
+                continue;
+            };
+            assert!(
+                sent.len() <= mtu + 4,
+                "one datagram within the transmit MTU: {}",
+                sent.len()
+            );
+            let (options, payload) = decoded(&sent);
+            let block = options
+                .iter()
+                .find(|(number, _)| *number == 27)
+                .expect("Block1")
+                .1
+                .clone();
+            let value = block.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
+            assert_eq!(value >> 4, received.len() as u32 / (16 << (value & 7)));
+            received.extend_from_slice(&payload);
+            let more = value & 8 != 0;
+            let token = usize::from(sent[0] & 15);
+            let mut reply = vec![0x60 | token as u8, if more { 95 } else { 68 }, sent[2], sent[3]];
+            reply.extend_from_slice(&sent[4..4 + token]);
+            reply.extend_from_slice(&[0xd0 | block.len() as u8, 14]);
+            reply.extend_from_slice(&block);
+            wire.borrow_mut().inbox.push_back(reply);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(received, body);
+        client.poll().unwrap();
+        assert!(wire
+            .borrow()
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Response { code: 68, .. })));
     }
     #[test]
     fn supplied_tcp_pdu_uses_the_runtime_receive_maximum() {

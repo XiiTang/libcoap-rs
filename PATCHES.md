@@ -112,7 +112,8 @@ PSK and supplied-I/O regressions. Other supported hosts retain their platform ga
 
 The controlled client accepts the native CSM receive domain, 64 through
 u32::MAX bytes, without an independent 16 MiB ceiling. Request options use
-the full configured PDU allowance rather than half of it. The native submodule
+the full transmit PDU size rather than half of it (see "Request PDU
+transmit size" below). The native submodule
 checks supplied-I/O TCP PDUs only against the runtime receive maximum;
 non-supplied-I/O clients retain the compile-time default.
 
@@ -416,3 +417,24 @@ native submodule are unchanged. This is a separate test portability repair.
 Validation: macOS arm64, combined libcoap-rs/libcoap-sys strict lib/test Clippy
 passes, and the repaired helper runs the native client/server exchange
 (`tests::test_coap_client_server_basic`) successfully.
+
+## Request PDU transmit size (Boundless #770)
+
+`Client::request` created each request PDU with the configured receive maximum
+(`Limits::maximum_pdu`, 65,507 bytes for a UDP embedding). libcoap splits a body
+into Block1 only when it exceeds the PDU's `max_size` less token and options
+(`src/coap_block.c` `coap_add_data_large_internal`), so any smaller body went
+out as one datagram: MTU-sized receivers dropped it and, above macOS's
+9,216-byte datagram limit, the send failed. Upstream `coap_new_pdu` sizes a
+request with `coap_session_max_pdu_size(session)` (`src/coap_pdu.c`
+`coap_new_pdu_lkd`): the transmit MTU, on a reliable session the peer's CSM
+Max-Message-Size, less DTLS overhead. The request now does the same, checks its
+option bytes against that size, and `Client::transmit_pdu_maximum` exposes it so
+the embedding application can refuse oversized options before construction.
+The receive maximum still bounds received PDUs and the advertised CSM size.
+
+`a_request_body_above_the_transmit_mtu_is_sent_as_block1_under_a_larger_receive_maximum`
+sends a 4,000-byte body under a 65,507-byte receive maximum, answers each block
+with 2.31 Continue and checks that every datagram fits the transmit MTU and the
+blocks reassemble to the body. It fails on the previous revision (one 4,013-byte
+datagram) and passes with this patch on macOS arm64.
