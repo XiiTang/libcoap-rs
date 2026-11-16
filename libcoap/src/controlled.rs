@@ -23,6 +23,36 @@ pub enum ResponseDecision {
     Reject,
     Stop,
 }
+/// How [`Client::request`] sizes the request it builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestSize {
+    /// At what one message of the session carries
+    /// (`coap_session_max_pdu_size`), as upstream `coap_new_pdu` sizes a
+    /// request; libcoap sends a larger body as Block1.
+    Transmit,
+    /// As one whole datagram of at most `maximum` bytes, header included, that
+    /// libcoap never splits: a group request has no Block1 exchange.
+    Datagram { maximum: usize },
+}
+/// Why [`Client::request`] sent nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    /// libcoap refused the request as too large for the size it is built
+    /// at, which is `maximum`: with [`RequestSize::Transmit`] the session's
+    /// message size, header excluded, and `observed` is absent, since libcoap
+    /// gives no room; with [`RequestSize::Datagram`] the datagram's maximum,
+    /// and `observed` is the whole encoded datagram.
+    TooLarge {
+        maximum: usize,
+        observed: Option<usize>,
+    },
+    Native(&'static str),
+}
+impl From<&'static str> for RequestError {
+    fn from(error: &'static str) -> Self {
+        Self::Native(error)
+    }
+}
 pub trait Callbacks {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize>;
@@ -447,6 +477,14 @@ impl Client {
         unsafe { coap_session_max_pdu_size(self.session) }
     }
 
+    /// Builds and sends one request. libcoap decides whether it fits: with
+    /// [`RequestSize::Transmit`] the PDU is the session's message size, and a
+    /// token and options it cannot hold, or a body for which its room
+    /// (`coap_add_data_large_internal`) holds neither the whole body nor one
+    /// block, is refused as [`RequestError::TooLarge`]. With
+    /// [`RequestSize::Datagram`] the request is one datagram, measured as
+    /// libcoap encodes it, of at most `maximum` bytes. Any other refusal is
+    /// [`RequestError::Native`].
     pub fn request(
         &mut self,
         token: &[u8],
@@ -454,61 +492,155 @@ impl Client {
         confirmable: bool,
         options: &[(u16, Vec<u8>)],
         payload: Vec<u8>,
-    ) -> Result<i32, &'static str> {
+        size: RequestSize,
+    ) -> Result<i32, RequestError> {
         self.check()?;
         if token.is_empty() || token.len() > 8 || !(1..=7).contains(&code) || payload.len() > self.maximum_body {
-            return Err("request limits exceeded");
+            return Err("request limits exceeded".into());
         }
-        let maximum = self.transmit_pdu_maximum();
-        if options.windows(2).any(|w| w[0].0 > w[1].0) || options.iter().map(|o| o.1.len() + 5).sum::<usize>() > maximum
-        {
-            return Err("option limits exceeded");
+        if options.windows(2).any(|w| w[0].0 > w[1].0) {
+            return Err("option limits exceeded".into());
         }
         unsafe {
             coap_session_set_runtime_peer(self.session, CoapAddress::from(self.peer).as_raw_address());
-            // Size the request as upstream `coap_new_pdu` does: libcoap splits a
-            // body into Block1 only beyond this size, so a receive maximum here
-            // would send any smaller body as one oversized message.
-            let pdu = coap_pdu_init(
-                if confirmable {
-                    coap_pdu_type_t_COAP_MESSAGE_CON
-                } else {
-                    coap_pdu_type_t_COAP_MESSAGE_NON
+            let pdu = match size {
+                RequestSize::Transmit => {
+                    // Size the request as upstream `coap_new_pdu` does: libcoap
+                    // splits a body into Block1 only beyond this size, so a
+                    // receive maximum here would send any smaller body as one
+                    // oversized message.
+                    let maximum = self.transmit_pdu_maximum();
+                    let pdu = self.bounded(confirmable, code, token, options, maximum)?;
+                    coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
+                    let body = Box::new(Zeroizing::new(payload));
+                    let length = body.len();
+                    let pointer = body.as_ptr();
+                    let body = Box::into_raw(body);
+                    let mut too_large = 0;
+                    // Native API invokes release on both the failure and success paths.
+                    if coap_add_data_large_runtime_request(
+                        self.session,
+                        pdu,
+                        length,
+                        pointer,
+                        Some(release),
+                        body.cast(),
+                        &mut too_large,
+                    ) != 1
+                    {
+                        coap_delete_pdu(pdu);
+                        return Err(if too_large != 0 {
+                            RequestError::TooLarge {
+                                maximum,
+                                observed: None,
+                            }
+                        } else {
+                            "body rejected".into()
+                        });
+                    }
+                    pdu
                 },
-                code.into(),
-                i32::from(coap_new_message_id(self.session)),
-                maximum,
-            );
-            if pdu.is_null() {
-                return Err("request allocation failed");
-            }
-            if coap_add_token(pdu, token.len(), token.as_ptr()) != 1 {
-                coap_delete_pdu(pdu);
-                return Err("token rejected");
-            }
-            for (number, value) in options {
-                if coap_add_option(pdu, *number, value.len(), value.as_ptr()) == 0 {
-                    coap_delete_pdu(pdu);
-                    return Err("option rejected");
-                }
-            }
-            let body = Box::new(Zeroizing::new(payload));
-            let length = body.len();
-            let pointer = body.as_ptr();
-            let body = Box::into_raw(body);
-            if coap_add_data_large_request(self.session, pdu, length, pointer, Some(release), body.cast()) != 1 {
-                // Native API invokes release on both the failure and success paths.
-                coap_delete_pdu(pdu);
-                return Err("body rejected");
-            }
+                // Plain data: libcoap starts no Block1 toward a group.
+                RequestSize::Datagram { maximum } => {
+                    let payload = Zeroizing::new(payload);
+                    let probe = self.pdu(confirmable, code, token, options, 0)?;
+                    let added = payload.is_empty() || coap_add_data(probe, payload.len(), payload.as_ptr()) == 1;
+                    let used = coap_pdu_runtime_used_size(probe);
+                    coap_delete_pdu(probe);
+                    if !added {
+                        return Err("body rejected".into());
+                    }
+                    // The four-byte header of a datagram (RFC 7252 section 3).
+                    let observed = 4 + used;
+                    if observed > maximum {
+                        return Err(RequestError::TooLarge {
+                            maximum,
+                            observed: Some(observed),
+                        });
+                    }
+                    // Built at exactly its size, so libcoap adds nothing to it.
+                    let pdu = self.pdu(confirmable, code, token, options, used)?;
+                    if !payload.is_empty() && coap_add_data(pdu, payload.len(), payload.as_ptr()) != 1 {
+                        coap_delete_pdu(pdu);
+                        return Err("body rejected".into());
+                    }
+                    coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
+                    pdu
+                },
+            };
             let mid = coap_send(self.session, pdu);
             self.check()?;
             if mid < 0 {
-                Err("request send failed")
+                Err("request send failed".into())
             } else {
                 Ok(mid)
             }
         }
+    }
+
+    /// A PDU of `size` holding `token` and `options`. libcoap refuses a token
+    /// or option the PDU cannot hold as it refuses an allocation, so a refused
+    /// build is measured without a bound: [`RequestError::TooLarge`] when it
+    /// is larger than `size`, the native refusal otherwise.
+    unsafe fn bounded(
+        &self,
+        confirmable: bool,
+        code: u8,
+        token: &[u8],
+        options: &[(u16, Vec<u8>)],
+        size: usize,
+    ) -> Result<*mut coap_pdu_t, RequestError> {
+        match self.pdu(confirmable, code, token, options, size) {
+            Ok(pdu) => Ok(pdu),
+            Err(refused) => {
+                let probe = self.pdu(confirmable, code, token, options, 0)?;
+                let used = coap_pdu_runtime_used_size(probe);
+                coap_delete_pdu(probe);
+                if used > size {
+                    Err(RequestError::TooLarge {
+                        maximum: size,
+                        observed: None,
+                    })
+                } else {
+                    Err(refused.into())
+                }
+            },
+        }
+    }
+
+    /// A PDU of `size` (0: no bound) holding `token` and `options`.
+    unsafe fn pdu(
+        &self,
+        confirmable: bool,
+        code: u8,
+        token: &[u8],
+        options: &[(u16, Vec<u8>)],
+        size: usize,
+    ) -> Result<*mut coap_pdu_t, &'static str> {
+        let pdu = coap_pdu_init(
+            if confirmable {
+                coap_pdu_type_t_COAP_MESSAGE_CON
+            } else {
+                coap_pdu_type_t_COAP_MESSAGE_NON
+            },
+            code.into(),
+            0,
+            size,
+        );
+        if pdu.is_null() {
+            return Err("request allocation failed");
+        }
+        if coap_add_token(pdu, token.len(), token.as_ptr()) != 1 {
+            coap_delete_pdu(pdu);
+            return Err("token rejected");
+        }
+        for (number, value) in options {
+            if coap_add_option(pdu, *number, value.len(), value.as_ptr()) == 0 {
+                coap_delete_pdu(pdu);
+                return Err("option rejected");
+            }
+        }
+        Ok(pdu)
     }
 
     pub fn forget(&mut self, token: &[u8]) -> Result<(), &'static str> {
@@ -1084,6 +1216,10 @@ mod controlled_io_tests {
             self.0.borrow_mut().events.push(event);
             true
         }
+
+        fn reserve_sender(&mut self, _: u64) -> bool {
+            true
+        }
     }
     /// A piggybacked 2.05 answering `request` with `options` and `payload`.
     fn answer(request: &[u8], options: &[u8], payload: &[u8]) -> Vec<u8> {
@@ -1150,7 +1286,9 @@ mod controlled_io_tests {
     fn a_reset_names_the_request_it_answers_before_its_nack() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];
-        client.request(&token, 1, true, &[], vec![]).unwrap();
+        client
+            .request(&token, 1, true, &[], vec![], RequestSize::Transmit)
+            .unwrap();
         client.poll().unwrap();
         let sent = wire.borrow().written.last().unwrap().clone();
         wire.borrow_mut().inbox.push_back(reset(&sent));
@@ -1165,7 +1303,9 @@ mod controlled_io_tests {
     fn a_reset_of_a_later_block2_block_names_the_application_token() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];
-        client.request(&token, 1, true, &[], vec![]).unwrap();
+        client
+            .request(&token, 1, true, &[], vec![], RequestSize::Transmit)
+            .unwrap();
         let first = wire.borrow().written.last().unwrap().clone();
         wire.borrow_mut()
             .inbox
@@ -1219,7 +1359,9 @@ mod controlled_io_tests {
     fn a_reset_of_a_later_block1_block_names_the_application_token() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];
-        client.request(&token, 3, true, &[], vec![b'a'; 2048]).unwrap();
+        client
+            .request(&token, 3, true, &[], vec![b'a'; 2048], RequestSize::Transmit)
+            .unwrap();
         let first = wire.borrow().written.last().unwrap().clone();
         let block = block1(&first);
         let mut options = vec![0xd0 | block.len() as u8, 14];
@@ -1260,7 +1402,9 @@ mod controlled_io_tests {
             Box::new(Scripted(wire.clone())),
         )
         .unwrap();
-        client.request(&[0x71], 1, false, &[], vec![]).unwrap();
+        client
+            .request(&[0x71], 1, false, &[], vec![], RequestSize::Transmit)
+            .unwrap();
         let request = wire.borrow().written.last().unwrap().clone();
         assert_eq!((request[0] >> 4) & 3, 1);
         wire.borrow_mut().inbox.push_back(reset(&request));
@@ -1290,7 +1434,9 @@ mod controlled_io_tests {
     fn an_unknown_reset_names_no_request() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];
-        client.request(&token, 1, true, &[], vec![]).unwrap();
+        client
+            .request(&token, 1, true, &[], vec![], RequestSize::Transmit)
+            .unwrap();
         let request = wire.borrow().written.last().unwrap().clone();
         let unknown = u16::from_be_bytes([request[2], request[3]])
             .wrapping_add(1)
@@ -1360,7 +1506,9 @@ mod controlled_io_tests {
     fn external_wait_preserves_a_silent_peers_retransmission() {
         let (wire, mut client) = scripted_client();
         let token = [0x71];
-        client.request(&token, 1, true, &[], Vec::new()).unwrap();
+        client
+            .request(&token, 1, true, &[], Vec::new(), RequestSize::Transmit)
+            .unwrap();
         assert_eq!(wire.borrow().written.len(), 1);
         let wait = client
             .prepare_wait()
@@ -1405,7 +1553,14 @@ mod controlled_io_tests {
         ] {
             let (wire, mut client) = scripted_client();
             client
-                .request(&[1], 2, true, &[(11, b"report".to_vec())], b"body".to_vec())
+                .request(
+                    &[1],
+                    2,
+                    true,
+                    &[(11, b"report".to_vec())],
+                    b"body".to_vec(),
+                    RequestSize::Transmit,
+                )
                 .unwrap();
             client.poll().unwrap();
             let request = wire.borrow().written.last().unwrap().clone();
@@ -1433,7 +1588,7 @@ mod controlled_io_tests {
     fn a_body_whose_blocks_outrun_tracking_fails_its_own_request_without_another() {
         let (wire, mut client) = scripted_client();
         client
-            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![])
+            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![], RequestSize::Transmit)
             .unwrap();
         client.poll().unwrap();
         // Each answer skips the block asked for, so every block opens a new
@@ -1463,7 +1618,9 @@ mod controlled_io_tests {
     fn outgoing_options_are_not_limited_by_the_receive_option_count() {
         let (wire, mut client) = scripted_client();
         let options = vec![(2048, Vec::new()); 129];
-        client.request(&[1], 1, false, &options, Vec::new()).unwrap();
+        client
+            .request(&[1], 1, false, &options, Vec::new(), RequestSize::Transmit)
+            .unwrap();
         let wire = wire.borrow();
         assert_eq!(wire.written.len(), 1);
         let packet = &wire.written[0];
@@ -1711,7 +1868,9 @@ mod controlled_io_tests {
                 Box::new(Scripted(wire.clone())),
             )
             .unwrap();
-            client.request(&[1], 1, true, &[], Vec::new()).unwrap();
+            client
+                .request(&[1], 1, true, &[], Vec::new(), RequestSize::Transmit)
+                .unwrap();
             let request = wire.borrow().written[0].clone();
             let mut options = vec![0xe0, 0x06, 0xf3];
             options.resize(options.len() + count - 1, 0);
@@ -1802,8 +1961,12 @@ mod controlled_io_tests {
                 client.poll().unwrap();
                 assert!(client.ready());
                 if pending {
-                    client.request(&[0x71], 1, true, &[], vec![]).unwrap();
-                    client.request(&[0x72], 1, true, &[], vec![]).unwrap();
+                    client
+                        .request(&[0x71], 1, true, &[], vec![], RequestSize::Transmit)
+                        .unwrap();
+                    client
+                        .request(&[0x72], 1, true, &[], vec![], RequestSize::Transmit)
+                        .unwrap();
                 }
                 wire.borrow_mut().events.clear();
                 // RFC 8323 length excludes code/token: raw option 2, raw option 4,
@@ -1895,7 +2058,9 @@ mod controlled_io_tests {
         let mtu = client.transmit_pdu_maximum();
         assert!(mtu < 4000, "the native default transmit MTU: {mtu}");
         let body = (0..=255u8).cycle().take(4000).collect::<Vec<_>>();
-        client.request(&[0x71], 3, true, &[], body.clone()).unwrap();
+        client
+            .request(&[0x71], 3, true, &[], body.clone(), RequestSize::Transmit)
+            .unwrap();
         let mut received = Vec::new();
         for _ in 0..64 {
             client.poll().unwrap();
@@ -1935,6 +2100,227 @@ mod controlled_io_tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::Response { code: 68, .. })));
+    }
+    /// Options whose encoding brings an 8-byte token and them to `envelope`
+    /// bytes (at least 15 + 269): one elective option, after an empty
+    /// `prefix` option when one is given. An empty Location-Query (20) leaves
+    /// Block1 a delta of 7; an empty Q-Block1 (19) is one libcoap removes
+    /// without Q-Block support before it measures the room.
+    fn sized_options(envelope: usize, prefix: Option<u16>) -> Vec<(u16, Vec<u8>)> {
+        match prefix {
+            Some(number) => vec![(number, Vec::new()), (2048, vec![b'o'; envelope - 15])],
+            None => vec![(2048, vec![b'o'; envelope - 13])],
+        }
+    }
+    /// Whether libcoap itself adds `body` to a request of `envelope`,
+    /// bypassing the client and sending nothing. Only a refusal leaves no
+    /// native state behind.
+    fn native_adds(client: &Client, envelope: usize, prefix: Option<u16>, body: &[u8]) -> bool {
+        unsafe {
+            let Ok(pdu) = client.pdu(
+                true,
+                3,
+                &[7; 8],
+                &sized_options(envelope, prefix),
+                client.transmit_pdu_maximum(),
+            ) else {
+                return false;
+            };
+            let added =
+                coap_add_data_large_request(client.session, pdu, body.len(), body.as_ptr(), None, ptr::null_mut());
+            if added != 1 {
+                coap_delete_pdu(pdu);
+            }
+            added == 1
+        }
+    }
+    #[test]
+    fn a_request_is_refused_as_too_large_exactly_where_libcoap_refuses_it() {
+        for oscore in [false, true] {
+            for prefix in [None, Some(20), Some(19)] {
+                // An empty and a 17-byte body that go whole, and a 100-byte one
+                // that is split, which crosses both of libcoap's size steps.
+                for body in [Vec::new(), vec![b'b'; 17], vec![b'b'; 100]] {
+                    let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+                    let mut client = Client::new(
+                        "127.0.0.1:5683".parse().unwrap(),
+                        false,
+                        Security::None,
+                        oscore.then(|| Oscore {
+                            configuration: oscore_configuration(1, 0).into(),
+                            sender_next: 0,
+                            replay: vec![],
+                        }),
+                        Limits {
+                            maximum_pdu: 65507,
+                            maximum_body: 4096,
+                            maximum_options: 128,
+                            maximum_retransmit: 4,
+                            ack_timeout_ms: 2000,
+                        },
+                        Box::new(Scripted(wire.clone())),
+                    )
+                    .unwrap();
+                    let pdu = client.transmit_pdu_maximum();
+                    let case = format!("oscore {oscore}, prefix {prefix:?}, {} B", body.len());
+                    // From one byte more than the message holds, down to the
+                    // first envelope the client sends. NON, so NSTART defers
+                    // none of them behind another.
+                    let mut envelope = pdu + 1;
+                    let sent = loop {
+                        let before = wire.borrow().written.len();
+                        match client.request(
+                            &[1; 8],
+                            3,
+                            false,
+                            &sized_options(envelope, prefix),
+                            body.clone(),
+                            RequestSize::Transmit,
+                        ) {
+                            Ok(_) => break envelope,
+                            Err(refused) => {
+                                assert_eq!(
+                                    refused,
+                                    RequestError::TooLarge {
+                                        maximum: pdu,
+                                        observed: None
+                                    },
+                                    "{case}, {envelope} B"
+                                );
+                                assert_eq!(wire.borrow().written.len(), before, "a refused request writes nothing");
+                            },
+                        }
+                        envelope -= 1;
+                        assert!(envelope > pdu - 100, "{case}: nothing sent");
+                    };
+                    // libcoap's own boundary: it refuses one byte more itself.
+                    assert!(!native_adds(&client, sent + 1, prefix, &body), "{case}, {sent} B");
+                    if !oscore {
+                        let written = wire.borrow().written.last().cloned().unwrap();
+                        let (options, payload) = decoded(&written);
+                        let split = body.len() > 17;
+                        assert_eq!(payload.len(), if split { 16 } else { body.len() }, "{case}");
+                        assert_eq!(options.iter().any(|(number, _)| *number == 27), split, "{case}: Block1");
+                        assert!(
+                            options.iter().all(|(number, _)| *number != 19),
+                            "{case}: Q-Block1 removed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// A reliable peer the test feeds by hand.
+    struct Reliable(Rc<std::cell::RefCell<Wire>>);
+    impl Callbacks for Reliable {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            let packet = self.0.borrow_mut().inbox.pop_front().ok_or(io::ErrorKind::WouldBlock)?;
+            buffer[..packet.len()].copy_from_slice(&packet);
+            Ok((packet.len(), None))
+        }
+
+        fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
+            self.0.borrow_mut().written.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn event(&mut self, event: Event) -> bool {
+            self.0.borrow_mut().events.push(event);
+            true
+        }
+    }
+    #[test]
+    fn a_session_whose_reservations_exceed_its_message_size_refuses_every_request() {
+        for oscore in [true, false] {
+            let wire = Rc::new(std::cell::RefCell::new(Wire::default()));
+            // The largest OSCORE identifiers: a 7-byte Sender ID and a 32-byte ID Context.
+            let configuration = format!(
+                "master_secret,hex,\"0102030405060708090a0b0c0d0e0f10\"\nsender_id,hex,\"{}\"\nid_context,hex,\"{}\"\nrecipient_id,hex,\"01\"\n",
+                "11".repeat(7),
+                "22".repeat(32)
+            );
+            let mut client = Client::new(
+                "127.0.0.1:5683".parse().unwrap(),
+                true,
+                Security::None,
+                oscore.then(|| Oscore {
+                    configuration: configuration.into_bytes().into(),
+                    sender_next: 0,
+                    replay: vec![],
+                }),
+                Limits {
+                    maximum_pdu: 1024,
+                    maximum_body: 4096,
+                    maximum_options: 128,
+                    maximum_retransmit: 4,
+                    ack_timeout_ms: 2000,
+                },
+                Box::new(Reliable(wire.clone())),
+            )
+            .unwrap();
+            // RFC 8323 CSM with Max-Message-Size 64, libcoap's floor.
+            wire.borrow_mut().inbox.push_back(vec![0x20, 0xe1, 0x21, 64]);
+            client.poll().unwrap();
+            assert!(client.ready(), "the peer's CSM establishes the session");
+            let before = wire.borrow().written.len();
+            let result = client.request(&[1; 8], 1, true, &[], Vec::new(), RequestSize::Transmit);
+            if oscore {
+                // 61 bytes less Echo (43) and OSCORE (58) leaves no room at
+                // all, and libcoap refuses even an empty body.
+                assert_eq!(
+                    result,
+                    Err(RequestError::TooLarge {
+                        maximum: client.transmit_pdu_maximum(),
+                        observed: None
+                    })
+                );
+                assert_eq!(wire.borrow().written.len(), before, "a refused request writes nothing");
+            } else {
+                result.unwrap();
+                assert_eq!(wire.borrow().written.len(), before + 1, "the request is written");
+            }
+        }
+    }
+    #[test]
+    fn a_group_request_is_one_whole_datagram_and_never_block1() {
+        let (wire, mut client) = scripted_client();
+        let body = (0..=255u8).cycle().take(4000).collect::<Vec<_>>();
+        let whole = 4 + 8 + 1 + body.len();
+        assert_eq!(
+            client.request(
+                &[1; 8],
+                3,
+                false,
+                &[],
+                body.clone(),
+                RequestSize::Datagram { maximum: whole - 1 }
+            ),
+            Err(RequestError::TooLarge {
+                maximum: whole - 1,
+                observed: Some(whole)
+            })
+        );
+        assert!(wire.borrow().written.is_empty(), "a refused request writes nothing");
+        client
+            .request(
+                &[1; 8],
+                3,
+                false,
+                &[],
+                body.clone(),
+                RequestSize::Datagram { maximum: whole },
+            )
+            .unwrap();
+        let wire = wire.borrow();
+        assert_eq!(wire.written.len(), 1);
+        let sent = &wire.written[0];
+        assert_eq!(sent.len(), whole, "one datagram holds the whole request");
+        let (options, payload) = decoded(sent);
+        assert!(
+            options.iter().all(|(number, _)| *number != 27),
+            "no Block1: {options:?}"
+        );
+        assert_eq!(payload, body);
     }
     #[test]
     fn supplied_tcp_pdu_uses_the_runtime_receive_maximum() {
@@ -2004,7 +2390,9 @@ mod controlled_io_tests {
             )
             .unwrap();
             // Register the exchange before its hand-authored response arrives.
-            client.request(&[1], 1, false, &[], Vec::new()).unwrap();
+            client
+                .request(&[1], 1, false, &[], Vec::new(), RequestSize::Transmit)
+                .unwrap();
             let mut failed = false;
             for _ in 0..(payload_size / 64 + 1024) {
                 if client.poll().is_err() {

@@ -428,13 +428,59 @@ out as one datagram: MTU-sized receivers dropped it and, above macOS's
 9,216-byte datagram limit, the send failed. Upstream `coap_new_pdu` sizes a
 request with `coap_session_max_pdu_size(session)` (`src/coap_pdu.c`
 `coap_new_pdu_lkd`): the transmit MTU, on a reliable session the peer's CSM
-Max-Message-Size, less DTLS overhead. The request now does the same, checks its
-option bytes against that size, and `Client::transmit_pdu_maximum` exposes it so
-the embedding application can refuse oversized options before construction.
+Max-Message-Size, less DTLS overhead. The request now does the same, and
+`Client::transmit_pdu_maximum` exposes that size.
 The receive maximum still bounds received PDUs and the advertised CSM size.
+
+`Client::request` takes a `RequestSize`. A request libcoap refuses as too large
+is `RequestError::TooLarge {maximum, observed}` and sends nothing; every other
+refusal stays `RequestError::Native`. The binding computes no room of its own:
+libcoap normalises a request before it measures it (it removes Q-Block1 without
+Q-Block support, encodes a Request-Tag from a random counter in as few bytes as
+it needs, reserves a response's Echo, OSCORE and an 8-byte token), and a copy
+of that measurement refused requests libcoap sends.
+
+- `RequestSize::Transmit` builds the PDU at the transmit size. Upstream refuses
+  a request that does not fit at three points, each with a bare 0 (native
+  PATCHES.md, "A request that does not fit, typed"): `coap_add_token` or
+  `coap_add_option` when the PDU cannot hold them, and
+  `coap_add_data_large_internal` when its room holds neither the whole body nor
+  one 16-byte block, before or after it adds Block1, Size1 and a Request-Tag.
+  For the first, the binding builds the same token and options without a size
+  bound and reads `coap_pdu_runtime_used_size`: larger than the transmit size is
+  `TooLarge`, anything else the native refusal. For the other two it calls
+  `coap_add_data_large_runtime_request`, whose flag says the refusal was for
+  size. `maximum` is the transmit size and `observed` is absent, since libcoap
+  knows its room only at the step that refused.
+- `RequestSize::Datagram {maximum}` measures the request libcoap encodes,
+  without a size bound and with its body added by `coap_add_data`, as the
+  four-byte header plus `coap_pdu_runtime_used_size`; one larger than `maximum`
+  is `TooLarge {maximum, observed}` with that size. Otherwise it builds the PDU
+  at exactly that size, so libcoap starts no Block1 toward a group and adds no
+  Request-Tag.
 
 `a_request_body_above_the_transmit_mtu_is_sent_as_block1_under_a_larger_receive_maximum`
 sends a 4,000-byte body under a 65,507-byte receive maximum, answers each block
 with 2.31 Continue and checks that every datagram fits the transmit MTU and the
 blocks reassemble to the body. It fails on the previous revision (one 4,013-byte
 datagram) and passes with this patch on macOS arm64.
+
+`a_request_is_refused_as_too_large_exactly_where_libcoap_refuses_it` lowers the
+options one byte at a time from one byte more than the message holds until the
+client sends, with and without OSCORE, for an empty, a 17-byte (whole) and a
+100-byte (Block1) body, each after one elective option, an empty
+Location-Query that shortens Block1's delta, or an empty Q-Block1 libcoap
+removes. Every refusal on the way is `TooLarge {maximum: the transmit size}`
+and writes nothing, the split body's crosses both of libcoap's room steps, and
+libcoap's own `coap_add_data_large_request` refuses one byte more than what was
+sent. Admission computed outside libcoap refused the Q-Block1 cases at the
+envelope libcoap sends.
+`a_session_whose_reservations_exceed_its_message_size_refuses_every_request`
+answers `TooLarge {maximum: 61}` without `observed` on a 64-byte-CSM TCP session with
+that OSCORE context and sends on the same session without OSCORE.
+`a_group_request_is_one_whole_datagram_and_never_block1` sends a 4,000-byte
+body as one datagram without Block1 at `Datagram {maximum}` equal to its size
+and refuses it one byte below with `observed` its size. With these, `cargo test
+-p libcoap-rs --features runtime-io --locked -- --test-threads=1` passes and strict
+`cargo clippy -p libcoap-rs --features runtime-io --lib --tests -- -D warnings`
+passes on macOS arm64.
