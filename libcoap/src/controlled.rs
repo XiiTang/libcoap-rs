@@ -21,6 +21,10 @@ use crate::{context::ensure_coap_started, types::CoapAddress};
 pub enum ResponseDecision {
     Accept,
     Reject,
+    /// Accept this block and let its streamed body go: nothing more is
+    /// requested for it, and no `BODY_INCOMPLETE` follows. An observation
+    /// goes on with its next notification. Elsewhere it is `Accept`.
+    Abandon,
     Stop,
 }
 /// How [`Client::request`] sizes the request it builds.
@@ -901,6 +905,7 @@ unsafe extern "C" fn response(
         match s.callbacks.response(value) {
             ResponseDecision::Accept => coap_response_t_COAP_RESPONSE_OK,
             ResponseDecision::Reject => coap_response_t_COAP_RESPONSE_FAIL,
+            ResponseDecision::Abandon => coap_response_t_COAP_RESPONSE_ABANDON,
             ResponseDecision::Stop => {
                 s.failed = true;
                 coap_response_t_COAP_RESPONSE_FAIL
@@ -1214,6 +1219,10 @@ mod controlled_io_tests {
         inbox: std::collections::VecDeque<Vec<u8>>,
         written: Vec<Vec<u8>>,
         events: Vec<Event>,
+        /// Each response's answer, in order; Accept once they run out.
+        decisions: std::collections::VecDeque<ResponseDecision>,
+        /// How many packets had been written when each response was answered.
+        answered_at: Vec<usize>,
     }
     struct Scripted(Rc<std::cell::RefCell<Wire>>);
     impl Callbacks for Scripted {
@@ -1231,6 +1240,14 @@ mod controlled_io_tests {
         fn event(&mut self, event: Event) -> bool {
             self.0.borrow_mut().events.push(event);
             true
+        }
+
+        fn response(&mut self, event: Event) -> ResponseDecision {
+            let mut wire = self.0.borrow_mut();
+            wire.events.push(event);
+            let written = wire.written.len();
+            wire.answered_at.push(written);
+            wire.decisions.pop_front().unwrap_or(ResponseDecision::Accept)
         }
 
         fn reserve_sender(&mut self, _: u64) -> bool {
@@ -1599,6 +1616,324 @@ mod controlled_io_tests {
             assert_eq!(responses, 1, "{case}: only the first block is delivered");
             assert!(body_incomplete(&wire.events, &[1]), "{case}: {:?}", wire.events);
         }
+    }
+    /// A message of `kind` (0 CON, 1 NON) with `code` echoing `request`'s token.
+    fn message(kind: u8, code: u8, mid: u16, token: &[u8], options: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut message = vec![0x40 | (kind << 4) | token.len() as u8, code];
+        message.extend_from_slice(&mid.to_be_bytes());
+        message.extend_from_slice(token);
+        message.extend_from_slice(options);
+        if !payload.is_empty() {
+            message.push(0xff);
+            message.extend_from_slice(payload);
+        }
+        message
+    }
+    /// The Message ID a NON response echoes for libcoap to match its request.
+    fn mid_of(packet: &[u8]) -> u16 {
+        u16::from_be_bytes([packet[2], packet[3]])
+    }
+    fn token_of(packet: &[u8]) -> Vec<u8> {
+        packet[4..4 + usize::from(packet[0] & 15)].to_vec()
+    }
+    /// ETag `etag`, Observe `serial` when given, Block2 `number`/M/16 and Size2 32.
+    fn block2(etag: u8, serial: Option<u8>, number: u8, more: bool) -> Vec<u8> {
+        let mut options = vec![0x41, etag];
+        let mut last = 4;
+        if let Some(serial) = serial {
+            options.extend_from_slice(&[0x21, serial]);
+            last = 6;
+        }
+        options.extend_from_slice(&[0xd1, 23 - 13 - last, (number << 4) | if more { 8 } else { 0 }, 0x51, 32]);
+        options
+    }
+    fn requests(wire: &Wire) -> usize {
+        wire.written.iter().filter(|packet| packet[1] != 0).count()
+    }
+    fn responses_of(wire: &Wire) -> Vec<Vec<u8>> {
+        wire.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Response { payload, .. } => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Registers an observation on token 1 and answers it with one whole
+    /// notification, serial 1.
+    fn observing() -> (Rc<std::cell::RefCell<Wire>>, Client) {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(
+                &[1],
+                1,
+                true,
+                &[(6, vec![]), (11, b"obs".to_vec())],
+                vec![],
+                RequestSize::Transmit,
+            )
+            .unwrap();
+        client.poll().unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut()
+            .inbox
+            .push_back(answer(&request, &[0x61, 1], b"first"));
+        client.poll().unwrap();
+        assert_eq!(responses_of(&wire.borrow()), vec![b"first".to_vec()]);
+        (wire, client)
+    }
+    #[test]
+    fn abandoning_an_observation_s_first_block_requests_nothing_and_the_next_notification_arrives() {
+        let (wire, mut client) = observing();
+        let before = requests(&wire.borrow());
+        wire.borrow_mut().decisions.push_back(ResponseDecision::Abandon);
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(0, 69, 0x100, &[1], &block2(7, Some(2), 0, true), &[b'a'; 16]));
+        client.poll().unwrap();
+        client.poll().unwrap();
+        {
+            let wire = wire.borrow();
+            assert_eq!(requests(&wire), before, "no request for block 1");
+            let ack = wire.written.last().unwrap();
+            assert_eq!(
+                (ack[0] >> 4 & 3, ack[1], &ack[2..4]),
+                (2, 0, &[1, 0][..]),
+                "the block is acknowledged"
+            );
+            assert!(
+                !body_incomplete(&wire.events, &[1]),
+                "no BODY_INCOMPLETE: {:?}",
+                wire.events
+            );
+        }
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, 0x101, &[1], &[0x61, 3], b"next"));
+        client.poll().unwrap();
+        assert_eq!(
+            responses_of(&wire.borrow()),
+            vec![b"first".to_vec(), vec![b'a'; 16], b"next".to_vec()]
+        );
+    }
+    #[test]
+    fn abandoning_a_later_block_of_a_request_requests_nothing_more_and_drops_its_state() {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![], RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut()
+            .inbox
+            .push_back(answer(&request, &block2(7, None, 0, true), &[b'a'; 16]));
+        client.poll().unwrap();
+        let next = wire.borrow().written.last().unwrap().clone();
+        assert_eq!(requests(&wire.borrow()), 2, "block 1 is requested");
+        wire.borrow_mut().decisions.push_back(ResponseDecision::Abandon);
+        // Size2 64: block 1 still has more.
+        let mut options = block2(7, None, 1, true);
+        *options.last_mut().unwrap() = 64;
+        wire.borrow_mut().inbox.push_back(answer(&next, &options, &[b'b'; 16]));
+        client.poll().unwrap();
+        client.poll().unwrap();
+        assert_eq!(requests(&wire.borrow()), 2, "no request for block 2");
+        // A late copy of the abandoned block finds no body to continue.
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, 0x200, &token_of(&next), &options, &[b'b'; 16]));
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        assert_eq!(requests(&wire), 2);
+        assert_eq!(responses_of(&wire).len(), 2, "{:?}", wire.events);
+        assert!(!body_incomplete(&wire.events, &[1]));
+    }
+    #[test]
+    fn accepting_a_block_requests_the_next_once_after_the_answer() {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![], RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut().inbox.push_back(message(
+            1,
+            69,
+            mid_of(&request),
+            &token_of(&request),
+            &block2(7, None, 0, true),
+            &[b'a'; 16],
+        ));
+        client.poll().unwrap();
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        assert_eq!(requests(&wire), 2, "block 1 is requested once");
+        let at = wire.written.iter().rposition(|packet| packet[1] != 0).unwrap();
+        assert!(at >= wire.answered_at[0], "requested after the answer");
+    }
+    #[test]
+    fn rejecting_a_block_resets_it_and_requests_nothing_more() {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(&[1], 1, true, &[(11, b"large".to_vec())], vec![], RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let request = wire.borrow().written.last().unwrap().clone();
+        wire.borrow_mut().decisions.push_back(ResponseDecision::Reject);
+        wire.borrow_mut().inbox.push_back(message(
+            1,
+            69,
+            mid_of(&request),
+            &token_of(&request),
+            &block2(7, None, 0, true),
+            &[b'a'; 16],
+        ));
+        client.poll().unwrap();
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        assert_eq!(requests(&wire), 1, "no request for block 1");
+        let reset = wire.written.last().unwrap();
+        assert_eq!(
+            (reset[0] >> 4 & 3, reset[1], &reset[2..4]),
+            (3, 0, &request[2..4]),
+            "RST"
+        );
+    }
+    #[test]
+    fn abandoning_a_stale_first_block_of_an_idle_observation_requests_nothing() {
+        let (wire, mut client) = observing();
+        // A whole two-block notification, serial 5.
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, 0x500, &[1], &block2(7, Some(5), 0, true), &[b'a'; 16]));
+        client.poll().unwrap();
+        let next = wire.borrow().written.last().unwrap().clone();
+        assert_eq!(next[1], 1, "block 1 of serial 5 is requested");
+        wire.borrow_mut()
+            .inbox
+            .push_back(answer(&next, &block2(7, None, 1, false), &[b'b'; 16]));
+        client.poll().unwrap();
+        let before = requests(&wire.borrow());
+        // Serial 4's first block arrives late; the application finds it stale.
+        wire.borrow_mut().decisions.push_back(ResponseDecision::Abandon);
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, 0x501, &[1], &block2(6, Some(4), 0, true), &[b'c'; 16]));
+        client.poll().unwrap();
+        client.poll().unwrap();
+        assert_eq!(requests(&wire.borrow()), before, "nothing is requested for it");
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, 0x502, &[1], &[0x61, 6], b"fresh"));
+        client.poll().unwrap();
+        let wire = wire.borrow();
+        assert_eq!(responses_of(&wire).last().unwrap(), b"fresh");
+        assert!(!body_incomplete(&wire.events, &[1]));
+    }
+    /// Two group responders; each read names its own source.
+    #[derive(Default)]
+    struct Group {
+        inbox: std::collections::VecDeque<(Vec<u8>, SocketAddr)>,
+        written: Vec<(Vec<u8>, Option<SocketAddr>)>,
+        payloads: Vec<(SocketAddr, Vec<u8>)>,
+        decisions: std::collections::VecDeque<ResponseDecision>,
+    }
+    struct Grouped(Rc<std::cell::RefCell<Group>>);
+    impl Callbacks for Grouped {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
+            let (packet, peer) = self.0.borrow_mut().inbox.pop_front().ok_or(io::ErrorKind::WouldBlock)?;
+            buffer[..packet.len()].copy_from_slice(&packet);
+            Ok((packet.len(), Some(peer)))
+        }
+
+        fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize> {
+            self.0.borrow_mut().written.push((bytes.to_vec(), peer));
+            Ok(bytes.len())
+        }
+
+        fn event(&mut self, _: Event) -> bool {
+            true
+        }
+
+        fn response(&mut self, event: Event) -> ResponseDecision {
+            let mut group = self.0.borrow_mut();
+            if let Event::Response { payload, peer, .. } = event {
+                group.payloads.push((peer, payload));
+            }
+            group.decisions.pop_front().unwrap_or(ResponseDecision::Accept)
+        }
+    }
+    #[test]
+    fn abandoning_one_responder_s_body_leaves_another_s_going_on() {
+        let group = Rc::new(std::cell::RefCell::new(Group::default()));
+        let mut client = Client::new(
+            "239.255.0.1:5683".parse().unwrap(),
+            false,
+            Security::None,
+            None,
+            Limits {
+                maximum_pdu: 1024,
+                maximum_body: 4096,
+                maximum_options: 128,
+                maximum_retransmit: 4,
+                ack_timeout_ms: 2000,
+            },
+            Box::new(Grouped(group.clone())),
+        )
+        .unwrap();
+        client
+            .request(
+                &[0x71],
+                1,
+                false,
+                &[(11, b"large".to_vec())],
+                vec![],
+                RequestSize::Transmit,
+            )
+            .unwrap();
+        let request = group.borrow().written.last().unwrap().0.clone();
+        let first: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:5683".parse().unwrap();
+        group
+            .borrow_mut()
+            .decisions
+            .extend([ResponseDecision::Abandon, ResponseDecision::Accept]);
+        for (peer, mid, byte) in [(first, 0x600, b'a'), (second, 0x601, b'b')] {
+            group.borrow_mut().inbox.push_back((
+                message(1, 69, mid, &token_of(&request), &block2(7, None, 0, true), &[byte; 16]),
+                peer,
+            ));
+        }
+        client.poll().unwrap();
+        client.poll().unwrap();
+        let continuations = group
+            .borrow()
+            .written
+            .iter()
+            .filter(|(packet, _)| packet[1] != 0 && packet != &request)
+            .map(|(packet, peer)| (packet.clone(), *peer))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            continuations.len(),
+            1,
+            "only the second responder's block 1: {continuations:?}"
+        );
+        let (next, peer) = continuations[0].clone();
+        assert_eq!(peer, Some(second));
+        group.borrow_mut().inbox.push_back((
+            message(1, 69, 0x602, &token_of(&next), &block2(7, None, 1, false), &[b'c'; 16]),
+            second,
+        ));
+        client.poll().unwrap();
+        let group = group.borrow();
+        assert_eq!(
+            group.payloads,
+            vec![
+                (first, vec![b'a'; 16]),
+                (second, vec![b'b'; 16]),
+                (second, vec![b'c'; 16])
+            ]
+        );
     }
     #[test]
     fn a_body_whose_blocks_outrun_tracking_fails_its_own_request_without_another() {
