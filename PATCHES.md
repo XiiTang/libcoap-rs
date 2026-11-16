@@ -60,6 +60,46 @@ skips a block in every answer until the native received-range tracking
 overflows. Both fail without the native patch. A supplied write error stops the
 client, so a continuation request that cannot be sent has no case of its own.
 
+### A body the application lets go (Boundless #783, D1)
+
+An application that let a streamed body go, because it dropped the body's
+first block, released the body, or found a block stale or of a replaced
+representation, has no way to stop libcoap from fetching it: the response
+handler answers only OK (ACK) or FAIL (RST), and for a streamed body
+`coap_handle_response_get_block` sends the next block's request before it
+returns to `handle_response`, which only then runs the handler. Upstream does
+the same; it has no abandonment path, and FAIL sends an RST, which deregisters
+an observation (RFC 7641 §3.6). Californium (`BlockwiseLayer`) and aiocoap (its
+assembly task) stop fetching a body the application let go.
+
+So the next block's request of a streamed body is held on the session
+(`runtime_next_block`, `runtime_next_lg_crcv`) and `handle_response` decides it
+after the handler answers, with a third answer, `COAP_RESPONSE_ABANDON`
+(`ResponseDecision::Abandon`):
+
+- OK sends the held request. If it cannot be sent, the body is abandoned as
+  above, with `COAP_NACK_BODY_INCOMPLETE`, after the block was delivered.
+- FAIL drops it and sends the RST as before.
+- ABANDON drops it and ends the body through the same
+  `coap_abandon_streamed_body` without the NACK, since the application asked:
+  the block is acknowledged, an ordinary request's block state is deleted, and
+  an observation or a multicast responder's own child state returns to
+  `initial` for its next notification.
+- Anywhere no request is held (a single block, a last block, a body that is not
+  streamed) ABANDON is OK.
+
+A held request no handler answered is deleted with its session.
+
+`abandoning_an_observation_s_first_block_requests_nothing_and_the_next_notification_arrives`,
+`abandoning_a_later_block_of_a_request_requests_nothing_more_and_drops_its_state`,
+`abandoning_one_responder_s_body_leaves_another_s_going_on`,
+`abandoning_a_stale_first_block_of_an_idle_observation_requests_nothing`,
+`accepting_a_block_requests_the_next_once_after_the_answer` and
+`rejecting_a_block_resets_it_and_requests_nothing_more` answer each block by
+hand. With the native request sent before the handler again, as upstream does,
+all six fail on macOS arm64; with the patch they pass, and `cargo test -p
+libcoap-rs --features runtime-io --locked -- --test-threads=1` passes.
+
 ## OSCORE context presence
 
 The native submodule preserves absent versus present-empty ID Context in KDF
