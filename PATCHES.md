@@ -428,13 +428,55 @@ out as one datagram: MTU-sized receivers dropped it and, above macOS's
 9,216-byte datagram limit, the send failed. Upstream `coap_new_pdu` sizes a
 request with `coap_session_max_pdu_size(session)` (`src/coap_pdu.c`
 `coap_new_pdu_lkd`): the transmit MTU, on a reliable session the peer's CSM
-Max-Message-Size, less DTLS overhead. The request now does the same, checks its
-option bytes against that size, and `Client::transmit_pdu_maximum` exposes it so
-the embedding application can refuse oversized options before construction.
+Max-Message-Size, less DTLS overhead. The request now does the same, and
+`Client::transmit_pdu_maximum` exposes that size.
 The receive maximum still bounds received PDUs and the advertised CSM size.
+
+`Client::request` takes a `RequestSize` and refuses, before anything is sent, a
+request that does not fit it with the typed `RequestError::TooLarge {maximum,
+observed}`; other refusals stay `RequestError::Native`. `observed` is the
+token and the RFC 7252 encoding of the options; with `Datagram` it is the whole
+encoded datagram.
+
+- `RequestSize::Transmit` admits what `coap_add_data_large_internal`
+  (`src/coap_block.c`) can add. libcoap's room for a body is the PDU less the
+  token and options, a response's Echo (`coap_opt_encode_size(ECHO, 40)`), the
+  session's `coap_oscore_overhead` and the pad to an 8-byte token, all signed
+  as its `ssize_t avail`. A body that fits that room goes whole; otherwise
+  libcoap adds Block1, Size1 and a Request-Tag, recomputes the room and needs
+  one 16-byte block in it. The request is admitted on the first condition, or on
+  the second with those three options counted at their largest (3, 2 + the
+  body length's bytes, and 6 bytes). So admission is never looser than
+  libcoap's and stricter only by the bytes a Request-Tag below 2^24 saves.
+  `maximum` is the larger allowance, clamped at 0: a 64-byte CSM leaves 61
+  bytes, less than the Echo and OSCORE reservations of a 7-byte Sender ID and a
+  32-byte ID Context, and then no request fits that session. The OSCORE term is
+  measured by libcoap's own `coap_oscore_overhead`, an internal function of the
+  bundled static library, on a PDU holding only the request's Observe option,
+  the one option it reads.
+- `RequestSize::Datagram {maximum}` builds the PDU at exactly the encoded
+  request and adds the body with `coap_add_data`, so libcoap starts no Block1
+  toward a group; a request larger than `maximum` is refused.
+
+The message ID is drawn only once the request is admitted.
 
 `a_request_body_above_the_transmit_mtu_is_sent_as_block1_under_a_larger_receive_maximum`
 sends a 4,000-byte body under a 65,507-byte receive maximum, answers each block
 with 2.31 Continue and checks that every datagram fits the transmit MTU and the
 blocks reassemble to the body. It fails on the previous revision (one 4,013-byte
 datagram) and passes with this patch on macOS arm64.
+
+`request_admission_is_never_looser_than_libcoaps_body_condition_at_its_boundary`
+refuses one option byte more than the allowance with `TooLarge` and writes
+nothing, then sends at the allowance, with and without OSCORE, for an empty, a
+17-byte (whole) and a 100-byte (Block1) body; where the body goes whole,
+libcoap's own `coap_add_data_large_request` also refuses the byte more.
+`a_session_whose_reservations_exceed_its_message_size_refuses_every_request`
+answers `TooLarge {maximum: 0, observed: 8}` on a 64-byte-CSM TCP session with
+that OSCORE context and sends on the same session without OSCORE.
+`a_group_request_is_one_whole_datagram_and_never_block1` sends a 4,000-byte
+body as one datagram without Block1 at `Datagram {maximum}` equal to its size
+and refuses it one byte below. With these, `cargo test -p libcoap-rs --features
+runtime-io --locked -- --test-threads=1` passes all 49 tests and strict
+`cargo clippy -p libcoap-rs --features runtime-io --lib --tests -- -D warnings`
+passes on macOS arm64.
