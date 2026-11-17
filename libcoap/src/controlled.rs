@@ -108,24 +108,31 @@ impl PeerMessage {
     pub fn message_type(&self) -> u8 {
         self.message_type
     }
+
     pub fn code(&self) -> u8 {
         self.code
     }
+
     pub fn message_id(&self) -> i32 {
         self.message_id
     }
+
     pub fn token(&self) -> &[u8] {
         &self.token
     }
+
     pub fn options(&self) -> &[(u16, Vec<u8>)] {
         &self.options
     }
+
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+
     pub fn target(&self) -> &Target {
         &self.target
     }
+
     /// The native remote-address snapshot at receipt. With supplied I/O this
     /// can be an endpoint label or a SOCKS relay; the transport owner decides
     /// whether it is an observed target peer before using it as evidence.
@@ -647,16 +654,32 @@ impl Client {
         Ok(pdu)
     }
 
-    pub fn forget(&mut self, token: &[u8]) -> Result<(), &'static str> {
+    /// Forget every listed request's native state in one call.
+    ///
+    /// The call releases NSTART once it has removed an in-flight request, so a
+    /// caller ending several requests at once passes all their tokens: a
+    /// request delayed behind one of them is then sent, and none of the listed
+    /// ones is.
+    pub fn forget(&mut self, tokens: &[&[u8]]) -> Result<(), &'static str> {
         self.check()?;
+        let tokens = tokens
+            .iter()
+            .map(|token| coap_bin_const_t {
+                length: token.len(),
+                s: token.as_ptr(),
+            })
+            .collect::<Vec<_>>();
         unsafe {
-            if coap_session_forget_runtime_token(self.session, token.as_ptr(), token.len()) != 1 {
+            if coap_session_forget_runtime_tokens(self.session, tokens.as_ptr(), tokens.len()) != 1 {
                 return Err("request cancellation failed");
             }
         }
         Ok(())
     }
 
+    /// Send the observation's one deregistration notice: a NON with Observe 1
+    /// and no body, in the registration's method. The caller ends and forgets
+    /// the observation without waiting for an answer.
     pub fn cancel_observe(&mut self, token: &[u8]) -> Result<(), &'static str> {
         self.check()?;
         let mut token = token.to_vec();
@@ -665,7 +688,7 @@ impl Client {
                 length: token.len(),
                 s: token.as_mut_ptr(),
             };
-            if coap_cancel_observe(self.session, &mut binary, coap_pdu_type_t_COAP_MESSAGE_CON) == 0 {
+            if coap_cancel_observe(self.session, &mut binary, coap_pdu_type_t_COAP_MESSAGE_NON) == 0 {
                 return Err("observation not active");
             }
         }
@@ -1541,7 +1564,7 @@ mod controlled_io_tests {
             assert_eq!(wire.written.len(), 2);
             assert_eq!(wire.written[0], wire.written[1]);
         }
-        client.forget(&token).unwrap();
+        client.forget(&[&token]).unwrap();
     }
     #[allow(
         clippy::unnecessary_cast,
@@ -2084,9 +2107,11 @@ mod controlled_io_tests {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)> {
                 self.0.recv_from(buffer).map(|(n, peer)| (n, Some(peer)))
             }
+
             fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize> {
                 self.0.send_to(bytes, peer.unwrap())
             }
+
             fn event(&mut self, _: Event) -> bool {
                 true
             }
@@ -2264,10 +2289,12 @@ mod controlled_io_tests {
                 buffer[..bytes.len()].copy_from_slice(&bytes);
                 Ok((bytes.len(), None))
             }
+
             fn write(&mut self, bytes: &[u8], _: Option<SocketAddr>) -> io::Result<usize> {
                 self.0.borrow_mut().written.push(bytes.to_vec());
                 Ok(bytes.len())
             }
+
             fn event(&mut self, event: Event) -> bool {
                 self.0.borrow_mut().events.push(event);
                 true
@@ -2769,5 +2796,254 @@ mod controlled_io_tests {
                 client.poll().unwrap();
             }
         }
+    }
+
+    /// The requests written from `from` on (empty ACKs and Resets excluded).
+    fn requests_after(wire: &Wire, from: usize) -> Vec<Vec<u8>> {
+        wire.written[from..]
+            .iter()
+            .filter(|packet| (1..32).contains(&packet[1]))
+            .cloned()
+            .collect()
+    }
+    /// `packet` is the one deregistration notice: a NON in `code` on `token`
+    /// with Observe 1, no payload, and no option describing a body.
+    fn assert_notice(packet: &[u8], code: u8, token: &[u8]) {
+        assert_eq!(packet[0] >> 4 & 3, 1, "the notice is a NON");
+        assert_eq!(packet[1], code, "the notice keeps the registration's method");
+        assert_eq!(token_of(packet), token, "the notice's token on the wire");
+        assert_bodyless(packet);
+    }
+    fn assert_bodyless(packet: &[u8]) {
+        let (options, payload) = decoded(packet);
+        assert!(payload.is_empty(), "the notice carries no body");
+        assert!(options.contains(&(6, vec![1])), "Observe 1: {options:?}");
+        assert!(
+            !options.iter().any(|(number, _)| matches!(number, 19 | 27 | 60)),
+            "no Block1, Q-Block1 or Size1: {options:?}"
+        );
+    }
+    /// The piggybacked 4.01 asking `request` to be resent with Echo `value`.
+    fn echo_challenge(request: &[u8], value: &[u8]) -> Vec<u8> {
+        // Echo is option 252: delta 13 + 239, then the value's length.
+        let mut options = vec![0xd0 | value.len() as u8, 239];
+        options.extend_from_slice(value);
+        let mut challenge = answer(request, &options, &[]);
+        challenge[1] = 129;
+        challenge.pop();
+        challenge
+    }
+    /// Registers an observation on `token` with `code` and `body`, answering
+    /// each Block1 block with 2.31 and the completing request with Observe 1.
+    /// With `echo_final`, the completing request is first answered 4.01 Echo.
+    /// Answers the token the peer registered.
+    fn register(
+        wire: &Rc<std::cell::RefCell<Wire>>,
+        client: &mut Client,
+        token: &[u8],
+        code: u8,
+        body: Vec<u8>,
+        echo_final: bool,
+    ) -> (Vec<u8>, usize) {
+        client
+            .request(token, code, true, &[(6, vec![])], body, RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let mut blocks = 0;
+        let mut echoed = !echo_final;
+        loop {
+            let sent = wire.borrow().written.last().unwrap().clone();
+            blocks += 1;
+            let more = decoded(&sent)
+                .0
+                .iter()
+                .find(|(number, _)| *number == 27)
+                .is_some_and(|(_, value)| value.last().is_some_and(|last| last & 8 != 0));
+            if more {
+                let block = block1(&sent);
+                let mut options = vec![0xd0 | block.len() as u8, 14];
+                options.extend(block);
+                let mut continued = answer(&sent, &options, &[]);
+                continued[1] = 95;
+                continued.pop();
+                wire.borrow_mut().inbox.push_back(continued);
+            } else if !echoed {
+                echoed = true;
+                wire.borrow_mut().inbox.push_back(echo_challenge(&sent, b"fresh"));
+            } else {
+                wire.borrow_mut().inbox.push_back(answer(&sent, &[0x61, 1], b"first"));
+                client.poll().unwrap();
+                return (token_of(&sent), blocks);
+            }
+            client.poll().unwrap();
+        }
+    }
+    /// Deregisters `token` as Boundless does (notice, then forget) and answers
+    /// the requests written for it.
+    fn deregister(wire: &Rc<std::cell::RefCell<Wire>>, client: &mut Client, token: &[u8]) -> Vec<Vec<u8>> {
+        let from = wire.borrow().written.len();
+        client.cancel_observe(token).unwrap();
+        client.forget(&[token]).unwrap();
+        client.poll().unwrap();
+        requests_after(&wire.borrow(), from)
+    }
+    #[test]
+    fn a_get_observation_is_deregistered_by_one_bodyless_non_on_its_token() {
+        let (wire, mut client) = observing();
+        let notices = deregister(&wire, &mut client, &[1]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_notice(&notices[0], 1, &[1]);
+    }
+    #[test]
+    fn a_get_observation_resent_with_echo_is_deregistered_on_the_echo_token() {
+        let (wire, mut client) = scripted_client();
+        let (registered, _) = register(&wire, &mut client, &[2], 1, vec![], true);
+        assert_ne!(registered, [2], "the Echo resend draws a new token");
+        let notices = deregister(&wire, &mut client, &[2]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_notice(&notices[0], 1, &registered);
+    }
+    #[test]
+    fn an_observation_re_registered_through_echo_on_a_continuation_is_deregistered_on_the_new_token() {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(&[3], 1, false, &[(6, vec![])], vec![], RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let registration = wire.borrow().written.last().unwrap().clone();
+        // The registration is established by a Block2 first block.
+        wire.borrow_mut().inbox.push_back(message(
+            1,
+            69,
+            mid_of(&registration),
+            &[3],
+            &block2(7, Some(1), 0, true),
+            &[b'a'; 16],
+        ));
+        client.poll().unwrap();
+        let continuation = wire.borrow().written.last().unwrap().clone();
+        assert_eq!(continuation[0] >> 4 & 3, 1, "the continuation of a NON is a NON");
+        assert!(!decoded(&continuation).0.iter().any(|(number, _)| *number == 6));
+        let mut options = vec![0xd5, 239];
+        options.extend_from_slice(b"fresh");
+        wire.borrow_mut().inbox.push_back(message(
+            1,
+            129,
+            mid_of(&continuation),
+            &token_of(&continuation),
+            &options,
+            &[],
+        ));
+        client.poll().unwrap();
+        let resent = wire.borrow().written.last().unwrap().clone();
+        let resent_options = decoded(&resent).0;
+        assert!(
+            resent_options.contains(&(6, vec![])),
+            "the saved registration is resent: {resent_options:?}"
+        );
+        assert!(resent_options.iter().any(|(number, _)| *number == 252));
+        let registered = token_of(&resent);
+        assert_ne!(registered, [3]);
+        wire.borrow_mut()
+            .inbox
+            .push_back(message(1, 69, mid_of(&resent), &registered, &[0x61, 2], b"whole"));
+        client.poll().unwrap();
+        let notices = deregister(&wire, &mut client, &[3]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_notice(&notices[0], 1, &registered);
+    }
+    #[test]
+    fn a_multi_block_fetch_observation_is_deregistered_by_one_bodyless_fetch_on_its_final_block_token() {
+        let (wire, mut client) = scripted_client();
+        let (registered, blocks) = register(&wire, &mut client, &[4], 5, vec![b'q'; 2500], false);
+        assert!(blocks >= 3, "the selector needs three blocks: {blocks}");
+        assert_ne!(registered, [4]);
+        let notices = deregister(&wire, &mut client, &[4]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_notice(&notices[0], 5, &registered);
+        // A late 2.31 for the notice continues no upload.
+        let from = wire.borrow().written.len();
+        let mut continued = message(1, 95, mid_of(&notices[0]), &registered, &[0xd1, 14, 0x0e], &[]);
+        continued[0] = 0x50 | registered.len() as u8;
+        wire.borrow_mut().inbox.push_back(continued);
+        client.poll().unwrap();
+        assert!(requests_after(&wire.borrow(), from).is_empty());
+    }
+    #[test]
+    fn a_fetch_whose_final_block_was_resent_with_echo_gets_one_bodyless_notice() {
+        // Its token is not asserted: libcoap saves no token for an Echo resend
+        // of a Block1 block, a best-effort case Boundless accepts.
+        let (wire, mut client) = scripted_client();
+        let _ = register(&wire, &mut client, &[5], 5, vec![b'q'; 2500], true);
+        let notices = deregister(&wire, &mut client, &[5]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0][1], 5);
+        assert_bodyless(&notices[0]);
+    }
+    #[test]
+    fn a_reset_for_a_non_frees_no_nstart_slot() {
+        let (wire, mut client) = scripted_client();
+        client
+            .request(&[0x0a], 1, false, &[], vec![], RequestSize::Transmit)
+            .unwrap();
+        client
+            .request(&[0x0b], 1, true, &[], vec![], RequestSize::Transmit)
+            .unwrap();
+        client
+            .request(&[0x0c], 1, true, &[], vec![], RequestSize::Transmit)
+            .unwrap();
+        client.poll().unwrap();
+        let sent = wire.borrow().written.clone();
+        assert_eq!(
+            sent.iter().map(|packet| token_of(packet)).collect::<Vec<_>>(),
+            [vec![0x0a], vec![0x0b]],
+            "C waits behind B (NSTART 1)"
+        );
+        wire.borrow_mut().inbox.push_back(reset(&sent[0]));
+        client.poll().unwrap();
+        assert!(
+            !wire.borrow().written.iter().any(|packet| token_of(packet) == [0x0c]),
+            "a Reset for the NON leaves C delayed behind B"
+        );
+        wire.borrow_mut().inbox.push_back(answer(&sent[1], &[], b"b"));
+        client.poll().unwrap();
+        assert_eq!(
+            token_of(wire.borrow().written.last().unwrap()),
+            [0x0c],
+            "B's answer frees the slot for C"
+        );
+    }
+    #[test]
+    fn forgetting_an_in_flight_con_sends_the_request_delayed_behind_it() {
+        let (wire, mut client) = scripted_client();
+        for token in [0x0a, 0x0b] {
+            client
+                .request(&[token], 1, true, &[], vec![], RequestSize::Transmit)
+                .unwrap();
+        }
+        client.poll().unwrap();
+        assert_eq!(wire.borrow().written.len(), 1);
+        client.forget(&[&[0x0a]]).unwrap();
+        assert_eq!(token_of(wire.borrow().written.last().unwrap()), [0x0b]);
+        assert_eq!(wire.borrow().written.len(), 2);
+    }
+    #[test]
+    fn forgetting_several_requests_at_once_sends_none_of_them() {
+        let (wire, mut client) = scripted_client();
+        for token in [0x0a, 0x0b, 0x0c] {
+            client
+                .request(&[token], 1, true, &[], vec![], RequestSize::Transmit)
+                .unwrap();
+        }
+        client.poll().unwrap();
+        assert_eq!(wire.borrow().written.len(), 1);
+        client.forget(&[&[0x0a], &[0x0b]]).unwrap();
+        let written = wire
+            .borrow()
+            .written
+            .iter()
+            .map(|packet| token_of(packet))
+            .collect::<Vec<_>>();
+        assert_eq!(written, [vec![0x0a], vec![0x0c]], "C is sent and B never is");
     }
 }

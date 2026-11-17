@@ -524,3 +524,27 @@ and refuses it one byte below with `observed` its size. With these, `cargo test
 -p libcoap-rs --features runtime-io --locked -- --test-threads=1` passes and strict
 `cargo clippy -p libcoap-rs --features runtime-io --lib --tests -- -D warnings`
 passes on macOS arm64.
+
+## CoAP stage 1: batched forget and the deregistration notice (Boundless)
+
+The native pin moves to the fork's CoAP stage 1 patches (native `PATCHES.md`:
+two upstream ports, a batched forget, Reset accounting and one bodyless
+deregistration notice).
+
+- `Client::forget` takes every token to forget, `&[&[u8]]`, and calls
+  `coap_session_forget_runtime_tokens` once. The native call releases NSTART
+  after removing an in-flight CON, so a caller ending several requests passes
+  them together and none of them is sent by that release.
+- `Client::cancel_observe` sends its notice as a NON. The caller ends and
+  forgets the observation in the same step without waiting for an answer, so
+  a CON's retransmission would only be libcoap sending for an ended request.
+  libcoap's session close already cancels with NON.
+
+Regressions in `controlled_io_tests` drive the native client through supplied
+I/O and assert the wire: the two forget cases, the Reset case and the five
+notice cases named in the native `PATCHES.md`. Without the native patches
+five fail (both forget cases, the Reset case and the two FETCH notices); with
+them `cargo +1.97.0 test -p libcoap-rs --no-default-features --features
+runtime-io --locked -- --test-threads=1` passes (43 tests) and strict
+`cargo +1.97.0 clippy -p libcoap-rs --lib --tests --no-default-features
+--features runtime-io --locked -- -D warnings` passes on macOS arm64.
