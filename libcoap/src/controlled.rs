@@ -236,6 +236,7 @@ struct State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseNoticesError {
     PartialFrame,
+    NoticeRefused,
     Native,
 }
 
@@ -256,6 +257,15 @@ impl Client {
             fn coap_context_test_refuse_initial_con(context: *mut coap_context_t);
         }
         unsafe { coap_context_test_refuse_initial_con(self.context) };
+    }
+
+    /// Refuse this context's next normal-close notice build.
+    #[cfg(feature = "native-test-adapter")]
+    pub fn refuse_close_notice_for_tests(&mut self) {
+        unsafe extern "C" {
+            fn coap_context_test_refuse_close_notice(context: *mut coap_context_t);
+        }
+        unsafe { coap_context_test_refuse_close_notice(self.context) };
     }
 
     /// Advance the native receive-state sweep past the idle timeout.
@@ -709,6 +719,7 @@ impl Client {
         match result {
             1 => Ok(()),
             -1 => Err(CloseNoticesError::PartialFrame),
+            2 => Err(CloseNoticesError::NoticeRefused),
             _ => Err(CloseNoticesError::Native),
         }
     }

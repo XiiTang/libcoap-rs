@@ -595,7 +595,8 @@ after a malformed inner head.
 
 Upstream v4.3.5b can treat a queued native MID as successful Observe
 cancellation and then destroy unsent notice output with the session.
-Expose the controlled pre-release handoff result, keeping native release
+Expose the controlled pre-release handoff result, distinguishing an
+isolated notice refusal from an unusable transport, and keep native release
 and DTLS shutdown on the original owner. Boundless uses one close
 allowance for this callback, the pump's pending writes, and its final
 local TLS flush. The scoped native notice and final TLS flush tests
