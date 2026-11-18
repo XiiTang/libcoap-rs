@@ -587,7 +587,9 @@ refusal uses the existing native-send failure at the original request.
 The same response callback gets the application's token for a final Echo
 reply to a Block1 alias even after both native block records expire.
 Boundless's independent protected admission, ordering and Echo regression
-exercises all three outcomes.
+exercises all three outcomes. The authenticated Block1 and option-format
+regression also checks complete retry payload and preserves an active body
+after a malformed inner head.
 
 ## Bounded supplied close output (#795)
 
