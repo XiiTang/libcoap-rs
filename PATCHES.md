@@ -557,3 +557,14 @@ The binding keeps synchronous response and sent-PDU correlation. The
 Boundless test `separate_non_releases_con_credit_for_the_next_send` covers
 the early NON and matching Block2 continuation followed by live sibling
 progress.
+
+## Preserve outstanding requests on malformed datagram input (#863)
+
+The supplied client now validates ACKs and Resets before the native queue
+or Reset capture changes. Upstream v4.3.5b can unlink on an invalid-class
+datagram before discarding it. The binding retains its existing NACK and
+received-message mapping. Invalid input reaches the bad-packet diagnostic
+without inventing an exchange failure. The native raw Block2 checkpoint
+test is `t_runtime_raw_ack_requires_matching_con`. Boundless's
+`invalid_datagram_replies_leave_the_con_for_its_genuine_answer` checks the
+Program answer and sibling progress.
