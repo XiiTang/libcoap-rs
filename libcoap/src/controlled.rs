@@ -232,6 +232,13 @@ struct State {
     maximum_pdu: usize,
     maximum_options: usize,
 }
+/// A controlled pre-release step could not completely hand off its notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseNoticesError {
+    PartialFrame,
+    Native,
+}
+
 pub struct Client {
     context: *mut coap_context_t,
     session: *mut coap_session_t,
@@ -694,6 +701,16 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// Hand off eligible cancellation notices before releasing the supplied session.
+    pub fn close_notices(&mut self) -> Result<(), CloseNoticesError> {
+        let result = unsafe { coap_session_runtime_close_notices(self.session) };
+        match result {
+            1 => Ok(()),
+            -1 => Err(CloseNoticesError::PartialFrame),
+            _ => Err(CloseNoticesError::Native),
+        }
     }
 
     /// Send the observation's one deregistration notice: a NON with Observe 1
