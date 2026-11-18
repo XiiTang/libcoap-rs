@@ -576,3 +576,15 @@ could precede its retransmission allocation. The binding keeps the existing
 request-send refusal when native returns an invalid MID. Boundless uses
 the opt-in `native-test-adapter` feature only for its test dependency to
 inject one refusal in `initial_con_without_a_holder_sends_nothing`.
+
+## Protected reply ordering and block-mode Echo settlement
+
+Upstream v4.3.5b supplies the low-24-bit Observe option even when the
+replay window admits an unseen older Partial IV. Keep that capture and
+carry the native authenticated ordering decision separately to the runtime.
+An admitted but unprepared Echo retry delivers 4.01. An owned retry send
+refusal uses the existing native-send failure at the original request.
+The same response callback gets the application's token for a final Echo
+reply to a Block1 alias even after both native block records expire.
+Boundless's independent protected admission, ordering and Echo regression
+exercises all three outcomes.

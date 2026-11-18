@@ -154,6 +154,7 @@ pub enum Event {
         total: usize,
         more: bool,
         peer: SocketAddr,
+        oscore_ordered: bool,
     },
     Nack {
         token: Vec<u8>,
@@ -248,6 +249,15 @@ impl Client {
             fn coap_context_test_refuse_initial_con(context: *mut coap_context_t);
         }
         unsafe { coap_context_test_refuse_initial_con(self.context) };
+    }
+
+    /// Advance the native receive-state sweep past the idle timeout.
+    #[cfg(feature = "native-test-adapter")]
+    pub fn expire_block_state_for_tests(&mut self) {
+        unsafe extern "C" {
+            fn coap_session_test_expire_block_state(session: *mut coap_session_t);
+        }
+        unsafe { coap_session_test_expire_block_state(self.session) };
     }
 
     pub fn new(
@@ -912,6 +922,7 @@ unsafe extern "C" fn response(
             offset: fields.offset,
             total: fields.total,
             more,
+            oscore_ordered: coap_pdu_runtime_observe_ordered(pdu) != 0,
             peer: CoapAddress::from(&*coap_session_get_addr_remote(session))
                 .to_socket_addrs()
                 .unwrap()
