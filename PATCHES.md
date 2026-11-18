@@ -548,3 +548,12 @@ them `cargo +1.97.0 test -p libcoap-rs --no-default-features --features
 runtime-io --locked -- --test-threads=1` passes (43 tests) and strict
 `cargo +1.97.0 clippy -p libcoap-rs --lib --tests --no-default-features
 --features runtime-io --locked -- -D warnings` passes on macOS arm64.
+
+## Response dispatch releases the detached CON
+
+The native pin repairs v4.3.5b's same-MID NON path. Upstream unlinks the
+matching CON before token-wide cancellation can release the NSTART slot.
+The binding keeps synchronous response and sent-PDU correlation. The
+Boundless test `separate_non_releases_con_credit_for_the_next_send` covers
+the early NON and matching Block2 continuation followed by live sibling
+progress.
