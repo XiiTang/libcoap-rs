@@ -589,7 +589,10 @@ reply to a Block1 alias even after both native block records expire.
 Boundless's independent protected admission, ordering and Echo regression
 exercises all three outcomes. The authenticated Block1 and option-format
 regression also checks complete retry payload and preserves an active body
-after a malformed inner head.
+after a malformed inner head. The test adapter can refuse the native saved
+payload copy without refusing the original send. The regression
+`independent_oscore_echo_answers_when_snapshot_payload_copy_fails` verifies
+the peer's 4.01 and the absence of a retry.
 
 ## Bounded supplied close output (#795)
 

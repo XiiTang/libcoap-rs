@@ -268,6 +268,15 @@ impl Client {
         unsafe { coap_context_test_refuse_close_notice(self.context) };
     }
 
+    /// Refuse the next payload copy into a controlled OSCORE request snapshot.
+    #[cfg(feature = "native-test-adapter")]
+    pub fn refuse_oscore_snapshot_payload_for_tests(&mut self) {
+        unsafe extern "C" {
+            fn coap_context_test_refuse_oscore_snapshot_payload(context: *mut coap_context_t);
+        }
+        unsafe { coap_context_test_refuse_oscore_snapshot_payload(self.context) };
+    }
+
     /// Advance the native receive-state sweep past the idle timeout.
     #[cfg(feature = "native-test-adapter")]
     pub fn expire_block_state_for_tests(&mut self) {
