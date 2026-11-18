@@ -568,3 +568,11 @@ without inventing an exchange failure. The native raw Block2 checkpoint
 test is `t_runtime_raw_ack_requires_matching_con`. Boundless's
 `invalid_datagram_replies_leave_the_con_for_its_genuine_answer` checks the
 Program answer and sibling progress.
+
+## Initial direct CON holder
+
+The native pin repairs the v4.3.5b ordering in which a direct CON write
+could precede its retransmission allocation. The binding keeps the existing
+request-send refusal when native returns an invalid MID. Boundless uses
+the opt-in `native-test-adapter` feature only for its test dependency to
+inject one refusal in `initial_con_without_a_holder_sends_nothing`.

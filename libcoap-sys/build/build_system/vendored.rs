@@ -81,6 +81,9 @@ impl VendoredBuildSystem {
             ] {
                 build.define(key, value);
             }
+            if cfg!(feature = "native-test-adapter") {
+                build.cflag("-DCOAP_RUNTIME_TEST=1");
+            }
             let prefix = build.build();
             println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
             println!("cargo:rustc-link-lib=static=coap-3");

@@ -241,6 +241,15 @@ pub struct Client {
     _thread: PhantomData<Rc<()>>,
 }
 impl Client {
+    /// Make this context's next direct initial datagram CON holder unavailable.
+    #[cfg(feature = "native-test-adapter")]
+    pub fn refuse_initial_con_holder_for_tests(&mut self) {
+        unsafe extern "C" {
+            fn coap_context_test_refuse_initial_con(context: *mut coap_context_t);
+        }
+        unsafe { coap_context_test_refuse_initial_con(self.context) };
+    }
+
     pub fn new(
         peer: SocketAddr,
         tcp: bool,

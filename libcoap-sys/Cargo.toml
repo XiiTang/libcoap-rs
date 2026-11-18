@@ -28,6 +28,7 @@ build = "build/main.rs"
 rust-version = "1.88.0"
 
 [features]
+native-test-adapter = ["runtime-io"]
 runtime-io = ["vendored", "dtls-openssl-sys-vendored"]
 # The default features match those of libcoap's configure script for
 # the minimum supported version.

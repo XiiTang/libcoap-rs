@@ -24,6 +24,7 @@ resolver = "2"
 rust-version = "1.91.0"
 
 [features]
+native-test-adapter = ["runtime-io", "libcoap-sys/native-test-adapter"]
 runtime-io = ["libcoap-sys/runtime-io", "dtls-psk", "dtls-pki", "tcp", "oscore"]
 default = ["dtls-psk", "tcp"]
 dtls = ["libcoap-sys/dtls"]
