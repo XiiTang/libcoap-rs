@@ -57,10 +57,20 @@ impl From<&'static str> for RequestError {
         Self::Native(error)
     }
 }
+/// Result of exact response selection for a message-layer client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseAdmission {
+    Ignore,
+    Acknowledge,
+    Accept,
+}
 pub trait Callbacks {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize>;
     fn event(&mut self, event: Event) -> bool;
+    fn admit_response(&mut self, _event: &Event, _protected: bool) -> ResponseAdmission {
+        ResponseAdmission::Ignore
+    }
     fn response(&mut self, event: Event) -> ResponseDecision {
         if self.event(event) {
             ResponseDecision::Accept
@@ -231,6 +241,7 @@ struct State {
     failed: bool,
     maximum_pdu: usize,
     maximum_options: usize,
+    selected_response: Option<(*const coap_pdu_t, Event)>,
 }
 /// A controlled pre-release step could not completely hand off its notices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +249,73 @@ pub enum CloseNoticesError {
     PartialFrame,
     NoticeRefused,
     Native,
+}
+
+/// Limits for the next application PDU, read without driving the native context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    pub pdu_maximum: usize,
+    pub message_maximum: usize,
+    pub bert: bool,
+    pub needs_first_response: bool,
+}
+
+/// One application-authored request. Only the first request in an operation
+/// can ask for native tag insertion.
+pub struct Message<'a> {
+    pub peer: SocketAddr,
+    pub token: &'a [u8],
+    pub code: u8,
+    pub confirmable: bool,
+    pub options: &'a [(u16, Vec<u8>)],
+    pub payload: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+pub enum TagInsertion {
+    Template,
+    Initial,
+    Upload,
+}
+
+/// An allocated PDU before it enters native I/O. The caller can book the
+/// actual tag and token before sending it.
+pub struct PreparedMessage<'a> {
+    pdu: *mut coap_pdu_t,
+    peer: SocketAddr,
+    session: *mut coap_session_t,
+    _owner: PhantomData<&'a Client>,
+}
+
+impl PreparedMessage<'_> {
+    pub fn request_tag(&self) -> Option<&[u8]> {
+        unsafe {
+            let mut iterator = std::mem::zeroed();
+            let option = coap_check_option(self.pdu, COAP_OPTION_RTAG as u16, &mut iterator);
+            (!option.is_null())
+                .then(|| std::slice::from_raw_parts(coap_opt_value(option), coap_opt_length(option) as usize))
+        }
+    }
+
+    pub fn send(mut self) -> Result<i32, RequestError> {
+        unsafe {
+            coap_session_set_runtime_peer(self.session, CoapAddress::from(self.peer).as_raw_address());
+            let pdu = std::mem::replace(&mut self.pdu, ptr::null_mut());
+            let mid = coap_send(self.session, pdu);
+            if mid < 0 {
+                return Err("request send failed".into());
+            }
+            Ok(mid)
+        }
+    }
+}
+
+impl Drop for PreparedMessage<'_> {
+    fn drop(&mut self) {
+        if !self.pdu.is_null() {
+            unsafe { coap_delete_pdu(self.pdu) };
+        }
+    }
 }
 
 pub struct Client {
@@ -294,6 +372,30 @@ impl Client {
         limits: Limits,
         callbacks: Box<dyn Callbacks>,
     ) -> Result<Self, &'static str> {
+        Self::open(peer, tcp, security, oscore, limits, callbacks, false)
+    }
+
+    /// Keep native message custody and let the supplied owner build each block.
+    pub fn message_layer(
+        peer: SocketAddr,
+        tcp: bool,
+        security: Security,
+        oscore: Option<Oscore>,
+        limits: Limits,
+        callbacks: Box<dyn Callbacks>,
+    ) -> Result<Self, &'static str> {
+        Self::open(peer, tcp, security, oscore, limits, callbacks, true)
+    }
+
+    fn open(
+        peer: SocketAddr,
+        tcp: bool,
+        security: Security,
+        oscore: Option<Oscore>,
+        limits: Limits,
+        callbacks: Box<dyn Callbacks>,
+        message_layer: bool,
+    ) -> Result<Self, &'static str> {
         if !(64..=u32::MAX as usize).contains(&limits.maximum_pdu) || limits.maximum_body == 0 {
             return Err("invalid client limits");
         }
@@ -323,6 +425,7 @@ impl Client {
                 failed: false,
                 maximum_pdu: limits.maximum_pdu,
                 maximum_options: limits.maximum_options,
+                selected_response: None,
             });
             let mut client = Self {
                 context,
@@ -338,7 +441,14 @@ impl Client {
             if coap_context_set_runtime_io(context, data, Some(read), Some(write), limits.maximum_pdu) != 1 {
                 return Err("controlled I/O unavailable");
             }
-            coap_context_set_block_mode(context, COAP_BLOCK_USE_LIBCOAP);
+            if message_layer {
+                if coap_context_set_runtime_message_layer(context) != 1 {
+                    return Err("controlled message layer unavailable");
+                }
+                coap_context_set_runtime_admit_response(context, Some(admit_response));
+            } else {
+                coap_context_set_block_mode(context, COAP_BLOCK_USE_LIBCOAP);
+            }
             coap_context_set_csm_max_message_size(context, limits.maximum_pdu as u32);
             coap_register_response_handler(context, Some(response));
             coap_register_nack_handler(context, Some(nack));
@@ -484,6 +594,87 @@ impl Client {
     pub fn ready(&self) -> bool {
         !self.state.failed
             && unsafe { coap_session_get_state(self.session) == coap_session_state_t_COAP_SESSION_STATE_ESTABLISHED }
+    }
+
+    pub fn capacity(&self) -> Option<Capacity> {
+        if self.state.failed {
+            return None;
+        }
+        unsafe {
+            let mut capacity = std::mem::zeroed::<coap_runtime_capacity_t>();
+            (coap_session_runtime_capacity(self.session, &mut capacity) == 1).then_some(Capacity {
+                pdu_maximum: capacity.pdu_maximum,
+                message_maximum: capacity.message_maximum,
+                bert: capacity.bert != 0,
+                needs_first_response: capacity.needs_first_response != 0,
+            })
+        }
+    }
+
+    /// Prepare a single PDU to a known responder. The multicast envelope uses
+    /// an exact-sized PDU, just like the whole-datagram path.
+    pub fn prepare_message(
+        &mut self,
+        message: Message<'_>,
+        size: RequestSize,
+        tag: TagInsertion,
+    ) -> Result<PreparedMessage<'_>, RequestError> {
+        let capacity = self.capacity().ok_or("message layer not ready")?;
+        if message.token.is_empty()
+            || message.token.len() > 8
+            || !(1..=7).contains(&message.code)
+            || message.payload.len() > self.maximum_body
+            || message.options.windows(2).any(|pair| pair[0].0 > pair[1].0)
+        {
+            return Err("request limits exceeded".into());
+        }
+        unsafe {
+            let fields = self.pdu(message.confirmable, message.code, message.token, message.options, 0)?;
+            let used = coap_pdu_runtime_used_size(fields);
+            coap_delete_pdu(fields);
+            let payload_size = message.payload.len() + usize::from(!message.payload.is_empty());
+            let bytes = used + payload_size;
+            let allocation = match size {
+                RequestSize::Transmit if bytes <= capacity.pdu_maximum => capacity.pdu_maximum,
+                RequestSize::Transmit => {
+                    return Err(RequestError::TooLarge {
+                        maximum: capacity.pdu_maximum,
+                        observed: None,
+                    })
+                },
+                RequestSize::Datagram { maximum } if bytes + 4 <= maximum => bytes,
+                RequestSize::Datagram { maximum } => {
+                    return Err(RequestError::TooLarge {
+                        maximum,
+                        observed: Some(bytes + 4),
+                    })
+                },
+            };
+            let pdu = self.pdu(
+                message.confirmable,
+                message.code,
+                message.token,
+                message.options,
+                allocation,
+            )?;
+            if matches!(tag, TagInsertion::Upload) {
+                coap_session_runtime_tag(self.session, pdu, 1);
+            }
+            if !message.payload.is_empty() && coap_add_data(pdu, message.payload.len(), message.payload.as_ptr()) != 1 {
+                coap_delete_pdu(pdu);
+                return Err("body rejected".into());
+            }
+            if !matches!(tag, TagInsertion::Template) {
+                coap_session_runtime_tag(self.session, pdu, 0);
+            }
+            coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
+            Ok(PreparedMessage {
+                pdu,
+                peer: message.peer,
+                session: self.session,
+                _owner: PhantomData,
+            })
+        }
     }
 
     pub fn check(&self) -> Result<(), &'static str> {
@@ -758,6 +949,7 @@ impl Drop for Client {
             coap_register_nack_handler(self.context, None);
             coap_register_event_handler(self.context, None);
             coap_context_set_runtime_received(self.context, None);
+            coap_context_set_runtime_admit_response(self.context, None);
             if !self.session.is_null() {
                 coap_session_release(self.session);
             }
@@ -936,36 +1128,72 @@ unsafe extern "C" fn received(
         }
     });
 }
+unsafe fn response_fields(state: &State, session: *mut coap_session_t, pdu: *const coap_pdu_t) -> Option<Event> {
+    let fields = read_fields(state, pdu)?;
+    let mut block: coap_block_b_t = std::mem::zeroed();
+    let more = coap_get_block_b(session, pdu, COAP_OPTION_BLOCK2 as u16, &mut block) != 0 && block.m() != 0;
+    Some(Event::Response {
+        token: fields.token,
+        code: coap_pdu_get_code(pdu) as u8,
+        message_type: coap_pdu_get_type(pdu) as u8,
+        mid: coap_pdu_get_mid(pdu),
+        options: fields.options,
+        payload: fields.payload,
+        offset: fields.offset,
+        total: fields.total,
+        more,
+        oscore_ordered: coap_pdu_runtime_observe_ordered(pdu) != 0,
+        peer: CoapAddress::from(&*coap_session_get_addr_remote(session))
+            .to_socket_addrs()
+            .ok()?
+            .next()?,
+    })
+}
+
+unsafe extern "C" fn admit_response(
+    session: *mut coap_session_t,
+    pdu: *const coap_pdu_t,
+    protected: std::ffi::c_int,
+) -> coap_runtime_response_admission_t {
+    guarded(
+        data(session),
+        coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_IGNORE,
+        |state| unsafe {
+            state.selected_response = None;
+            let Some(value) = response_fields(state, session, pdu) else {
+                state.failed = true;
+                return coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_IGNORE;
+            };
+            match state.callbacks.admit_response(&value, protected != 0) {
+                ResponseAdmission::Accept => {
+                    state.selected_response = Some((pdu, value));
+                    coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_ACCEPT
+                },
+                ResponseAdmission::Acknowledge => coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_ACK,
+                ResponseAdmission::Ignore => coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_IGNORE,
+            }
+        },
+    )
+}
+
 unsafe extern "C" fn response(
     session: *mut coap_session_t,
     _sent: *const coap_pdu_t,
     pdu: *const coap_pdu_t,
-    mid: coap_mid_t,
+    _mid: coap_mid_t,
 ) -> coap_response_t {
     guarded(data(session), coap_response_t_COAP_RESPONSE_FAIL, |s| unsafe {
-        let Some(fields) = read_fields(s, pdu) else {
+        let value = s.selected_response.take().filter(|(selected, _)| *selected == pdu);
+        let Some(mut value) = value
+            .map(|(_, value)| value)
+            .or_else(|| response_fields(s, session, pdu))
+        else {
             s.failed = true;
             return coap_response_t_COAP_RESPONSE_FAIL;
         };
-        let mut block: coap_block_b_t = std::mem::zeroed();
-        let more = coap_get_block_b(session, pdu, COAP_OPTION_BLOCK2 as u16, &mut block) != 0 && block.m() != 0;
-        let value = Event::Response {
-            token: fields.token,
-            code: coap_pdu_get_code(pdu) as u8,
-            message_type: coap_pdu_get_type(pdu) as u8,
-            mid,
-            options: fields.options,
-            payload: fields.payload,
-            offset: fields.offset,
-            total: fields.total,
-            more,
-            oscore_ordered: coap_pdu_runtime_observe_ordered(pdu) != 0,
-            peer: CoapAddress::from(&*coap_session_get_addr_remote(session))
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap(),
-        };
+        if let Event::Response { oscore_ordered, .. } = &mut value {
+            *oscore_ordered = coap_pdu_runtime_observe_ordered(pdu) != 0;
+        }
         match s.callbacks.response(value) {
             ResponseDecision::Accept => coap_response_t_COAP_RESPONSE_OK,
             ResponseDecision::Reject => coap_response_t_COAP_RESPONSE_FAIL,

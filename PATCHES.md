@@ -604,3 +604,19 @@ and DTLS shutdown on the original owner. Boundless uses one close
 allowance for this callback, the pump's pending writes, and its final
 local TLS flush. The scoped native notice and final TLS flush tests
 cover both transport cutoffs and successful local drain.
+
+## Application-owned blocks over the controlled message layer
+
+The opt-in message-layer constructor preserves the supplied I/O and security
+boundary while the caller owns each Block1 and Block2 PDU. It can read the
+native ready state and peer limits without driving I/O, prepare one measured
+PDU and inspect the actual optional Request-Tag before committing it to
+native send. The block-mode constructor stays available. The opted-in
+response-selection callback sees the exact inbound message before native
+response accounting or protected association changes. Dispatch reuses that
+PDU's response projection after native admission.
+
+The Boundless regression `supplied_message_layer_dispatches_only_an_admitted_block_head`
+drives a wrong-MID and a genuine piggybacked Block2 response through the
+public binding, checking CON credit, the admitted bytes and the lack of a
+native fetch.
