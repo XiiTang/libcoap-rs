@@ -62,6 +62,7 @@ impl From<&'static str> for RequestError {
 pub enum ResponseAdmission {
     Ignore,
     Acknowledge,
+    Reset,
     Accept,
 }
 /// Native application write outcome before bytes enter supplied transport.
@@ -88,10 +89,16 @@ pub trait Callbacks {
     fn admit_response(&mut self, _event: &Event, _protected: bool) -> ResponseAdmission {
         ResponseAdmission::Ignore
     }
+    fn admit_message(&mut self, event: &Event, protected: bool, _capacity: Capacity) -> ResponseAdmission {
+        self.admit_response(event, protected)
+    }
     fn continuation(&mut self, _capacity: Capacity) -> Option<Continuation> {
         None
     }
     fn continuation_result(&mut self, _result: Result<i32, RequestError>) {}
+    fn continuation_refused(&mut self, error: RequestError) {
+        self.continuation_result(Err(error));
+    }
     fn response(&mut self, event: Event) -> ResponseDecision {
         if self.event(event) {
             ResponseDecision::Accept
@@ -278,6 +285,8 @@ pub enum CloseNoticesError {
 pub struct Capacity {
     pub pdu_maximum: usize,
     pub message_maximum: usize,
+    pub security_overhead: usize,
+    pub reliable: bool,
     pub bert: bool,
     pub needs_first_response: bool,
 }
@@ -648,6 +657,10 @@ impl Client {
     pub fn ready(&self) -> bool {
         !self.state.failed
             && unsafe { coap_session_get_state(self.session) == coap_session_state_t_COAP_SESSION_STATE_ESTABLISHED }
+    }
+
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
     }
 
     pub fn capacity(&self) -> Option<Capacity> {
@@ -1096,6 +1109,27 @@ unsafe fn build_message(
         let payload_size = message.payload.len() + usize::from(!message.payload.is_empty());
         let bytes = used + payload_size;
         let allocation = match size {
+            RequestSize::Transmit if capacity.reliable => {
+                let length = bytes - message.token.len();
+                let header = if length < 13 {
+                    2
+                } else if length < 269 {
+                    3
+                } else if length < 65805 {
+                    4
+                } else {
+                    6
+                };
+                if bytes + header > capacity.message_maximum {
+                    return Err(RequestError::TooLarge {
+                        maximum: capacity.message_maximum,
+                        observed: Some(bytes + header),
+                    });
+                }
+                // Bound optional insertion too. The usual PDU budget is
+                // conservative near a length-header boundary.
+                capacity.pdu_maximum.max(bytes)
+            },
             RequestSize::Transmit if bytes <= capacity.pdu_maximum => capacity.pdu_maximum,
             RequestSize::Transmit => {
                 return Err(RequestError::TooLarge {
@@ -1137,6 +1171,8 @@ unsafe fn read_capacity(session: *mut coap_session_t) -> Option<Capacity> {
     (coap_session_runtime_capacity(session, &mut capacity) == 1).then_some(Capacity {
         pdu_maximum: capacity.pdu_maximum,
         message_maximum: capacity.message_maximum,
+        security_overhead: capacity.security_overhead,
+        reliable: capacity.reliable != 0,
         bert: capacity.bert != 0,
         needs_first_response: capacity.needs_first_response != 0,
     })
@@ -1178,7 +1214,7 @@ unsafe extern "C" fn continuation(
                 pdu
             },
             Err(error) => {
-                s.callbacks.continuation_result(Err(error));
+                s.callbacks.continuation_refused(error);
                 ptr::null_mut()
             },
         }
@@ -1343,12 +1379,17 @@ unsafe extern "C" fn admit_response(
                 state.failed = true;
                 return coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_IGNORE;
             };
-            match state.callbacks.admit_response(&value, protected != 0) {
+            let admission = match read_capacity(session) {
+                Some(capacity) => state.callbacks.admit_message(&value, protected != 0, capacity),
+                None => state.callbacks.admit_response(&value, protected != 0),
+            };
+            match admission {
                 ResponseAdmission::Accept => {
                     state.selected_response = Some((pdu, value));
                     coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_ACCEPT
                 },
                 ResponseAdmission::Acknowledge => coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_ACK,
+                ResponseAdmission::Reset => coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_RESET,
                 ResponseAdmission::Ignore => coap_runtime_response_admission_t_COAP_RUNTIME_RESPONSE_IGNORE,
             }
         },

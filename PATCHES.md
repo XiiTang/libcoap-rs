@@ -642,3 +642,10 @@ older frames using the existing bounded output callback. Both refuse behind
 a partial frame. A stale WANT_WRITE bit without a holder does not refuse a
 direct handoff. Boundless exercises all three explicit-deregister conditions
 in `supplied_message_layer_notice_reports_handoff_and_preserves_older_frame_order`.
+
+The adapter's message-layer receipt carries the active CSM capacity and
+distinguishes a continuation build refusal from the result of handing off
+a complete PDU. This preserves the admitted peer 4.01 when Echo preparation
+fails, while a protected retry's actual send failure remains a local result.
+Legacy response callbacks retain their signatures. The Boundless CoAP
+message-layer, Echo and bounded-close tests drive these paths.
