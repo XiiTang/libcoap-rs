@@ -334,14 +334,30 @@ impl PreparedMessage<'_> {
 
     pub fn send(mut self) -> Result<i32, RequestError> {
         unsafe {
-            let pdu = std::mem::replace(&mut self.pdu, ptr::null_mut());
-            coap_pdu_set_runtime_destination(pdu, CoapAddress::from(self.peer).as_raw_address());
+            let pdu = self.take_pdu();
             let mid = coap_send(self.session, pdu);
             if mid < 0 {
                 return Err("request send failed".into());
             }
             Ok(mid)
         }
+    }
+
+    /// A notice completes only once the supplied output accepts the frame.
+    pub fn handoff_notice(mut self, close: bool) -> Result<(), RequestError> {
+        unsafe {
+            let pdu = self.take_pdu();
+            if coap_send_runtime_notice(self.session, pdu, i32::from(close)) < 0 {
+                return Err("notice handoff failed".into());
+            }
+            Ok(())
+        }
+    }
+
+    unsafe fn take_pdu(&mut self) -> *mut coap_pdu_t {
+        let pdu = std::mem::replace(&mut self.pdu, ptr::null_mut());
+        coap_pdu_set_runtime_destination(pdu, CoapAddress::from(self.peer).as_raw_address());
+        pdu
     }
 }
 
