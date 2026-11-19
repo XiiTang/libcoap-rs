@@ -662,3 +662,21 @@ tag insertion, as upstream does in `coap_send_pdu`. The caller keeps that
 one-use value out of its retained transfer template. Boundless's
 `a_successful_echo_is_used_once_and_does_not_change_the_saved_template`
 exercises the initial send and successful Block2 fetch with a UDP peer.
+
+## Preparation and exact responder sizing
+
+The block-mode client fixes the first upload tag before its second sizing
+pass. The controlled binding exposes that one insertion on the skeleton
+with Size1. The CoAP owner then sizes the tagged first slice. The capacity
+snapshot keeps the native initial PDU allocation alongside the actual peer
+CSM limit. A responder fetch can carry the pinned multicast skeleton
+allowance across the bridge. Its destination still passes the normal
+UDP transmit authorization.
+
+The reliable builder measures the final options after tag or Echo insertion.
+Native protected preparation reports the ciphertext length and distinguishes
+preparation refusal from an owned send attempt. The binding uses the same
+disposition for the short Block2 head that the pin presents as 4.02.
+Boundless's CoAP transfer-pipeline witnesses cover both initial UDP limits,
+oversized multicast fetch, protected TCP, a raw CSM no-fit and the short
+head at loopback peers.
