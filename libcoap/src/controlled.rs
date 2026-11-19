@@ -341,6 +341,14 @@ impl PreparedMessage<'_> {
         }
     }
 
+    /// Add one peer-supplied Echo after building the request template.
+    pub fn insert_echo(&mut self, echo: &[u8]) -> Result<(), RequestError> {
+        if unsafe { coap_pdu_insert_runtime_echo(self.pdu, echo.as_ptr(), echo.len()) } != 1 {
+            return Err("Echo option rejected".into());
+        }
+        Ok(())
+    }
+
     pub fn send(mut self) -> Result<i32, RequestError> {
         unsafe {
             let pdu = self.take_pdu();

@@ -656,3 +656,9 @@ controlled UDP fixture checks the exact size, tag, Echo and completed Body
 at counter wrap. The native test adapter also exposes an ordinary libcoap
 server fixture on a real bound UDP socket for Block1 assembly and Block2
 response interoperability.
+
+Initial issue can apply one stored peer Echo to the prepared PDU after
+tag insertion, as upstream does in `coap_send_pdu`. The caller keeps that
+one-use value out of its retained transfer template. Boundless's
+`a_successful_echo_is_used_once_and_does_not_change_the_saved_template`
+exercises the initial send and successful Block2 fetch with a UDP peer.
