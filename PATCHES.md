@@ -649,3 +649,10 @@ a complete PDU. This preserves the admitted peer 4.01 when Echo preparation
 fails, while a protected retry's actual send failure remains a local result.
 Legacy response callbacks retain their signatures. The Boundless CoAP
 message-layer, Echo and bounded-close tests drive these paths.
+
+The continuation builder uses native Echo insertion, preserving the old
+PDU's capacity check before its following Request-Tag delta shrinks. A
+controlled UDP fixture checks the exact size, tag, Echo and completed Body
+at counter wrap. The native test adapter also exposes an ordinary libcoap
+server fixture on a real bound UDP socket for Block1 assembly and Block2
+response interoperability.

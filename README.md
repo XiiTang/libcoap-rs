@@ -11,6 +11,15 @@ Raw binding and safe wrapper for the [libcoap CoAP libary](https://github.com/ob
 Refer to the [documentation](https://docs.rs/libcoap-rs) for more information on using, building and the current state
 of supported features.
 
+## Supplied client I/O
+
+The `runtime-io` feature provides the single-owner `controlled::Client`.
+`message_layer` accepts a measured application PDU and uses the owner's
+admission and continuation decisions around the native message dispatcher.
+Libcoap retains framing, signaling, retransmission and security. The existing
+`new` constructor still supports native block mode. See [PATCHES.md](PATCHES.md)
+for the controlled boundaries and their witnesses.
+
 ## License
 
 Copyright © 2021-2026 Hugo Hakim Damer, the NAMIB Project Members, and the other libcoap-rs Contributors.

@@ -378,6 +378,123 @@ impl Drop for PreparedMessage<'_> {
     }
 }
 
+/// An ordinary native server used by the test adapter's loopback fixtures.
+#[cfg(feature = "native-test-adapter")]
+pub struct BlockServer {
+    context: *mut coap_context_t,
+    expected: Box<Vec<u8>>,
+    _thread: PhantomData<Rc<()>>,
+}
+
+#[cfg(feature = "native-test-adapter")]
+impl BlockServer {
+    pub fn bind(peer: SocketAddr, expected: Vec<u8>) -> Result<Self, &'static str> {
+        ensure_coap_started();
+        unsafe {
+            let context = coap_new_context(ptr::null());
+            if context.is_null() {
+                return Err("server context allocation failed");
+            }
+            let mut server = Self {
+                context,
+                expected: Box::new(expected),
+                _thread: PhantomData,
+            };
+            coap_context_set_block_mode(context, COAP_BLOCK_USE_LIBCOAP | COAP_BLOCK_SINGLE_BODY);
+            if coap_new_endpoint(
+                context,
+                CoapAddress::from(peer).as_raw_address(),
+                coap_proto_t_COAP_PROTO_UDP,
+            )
+            .is_null()
+            {
+                return Err("server endpoint bind failed");
+            }
+            let path = coap_new_str_const(b"roundtrip".as_ptr(), b"roundtrip".len());
+            if path.is_null() {
+                return Err("server resource path allocation failed");
+            }
+            let resource = coap_resource_init(path, COAP_RESOURCE_FLAGS_RELEASE_URI as std::ffi::c_int);
+            if resource.is_null() {
+                coap_delete_str_const(path);
+                return Err("server resource allocation failed");
+            }
+            coap_resource_set_userdata(resource, (&mut *server.expected as *mut Vec<u8>).cast());
+            coap_register_handler(resource, coap_request_t_COAP_REQUEST_PUT, Some(test_block_upload));
+            coap_register_handler(resource, coap_request_t_COAP_REQUEST_GET, Some(test_block_download));
+            coap_add_resource(context, resource);
+            Ok(server)
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<(), &'static str> {
+        // The wait only bounds how long the owner waits before checking the
+        // fixture's shutdown channel. Socket input is handled immediately.
+        if unsafe { coap_io_process(self.context, 25) } < 0 {
+            Err("server I/O failed")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "native-test-adapter")]
+impl Drop for BlockServer {
+    fn drop(&mut self) {
+        unsafe {
+            coap_free_context(self.context);
+        }
+    }
+}
+
+#[cfg(feature = "native-test-adapter")]
+unsafe extern "C" fn test_block_upload(
+    resource: *mut coap_resource_t,
+    _session: *mut coap_session_t,
+    request: *const coap_pdu_t,
+    _query: *const coap_string_t,
+    response: *mut coap_pdu_t,
+) {
+    let expected = &*coap_resource_get_userdata(resource).cast::<Vec<u8>>();
+    let mut data = ptr::null();
+    let (mut length, mut offset, mut total) = (0, 0, 0);
+    let exact = coap_get_data_large(request, &mut length, &mut data, &mut offset, &mut total) != 0
+        && offset == 0
+        && length == expected.len()
+        && total == length
+        && std::slice::from_raw_parts(data, length) == expected.as_slice();
+    coap_pdu_set_code(response, if exact { 68 } else { 128 });
+}
+
+#[cfg(feature = "native-test-adapter")]
+unsafe extern "C" fn test_block_download(
+    resource: *mut coap_resource_t,
+    session: *mut coap_session_t,
+    request: *const coap_pdu_t,
+    query: *const coap_string_t,
+    response: *mut coap_pdu_t,
+) {
+    let expected = &*coap_resource_get_userdata(resource).cast::<Vec<u8>>();
+    coap_pdu_set_code(response, 69);
+    if coap_add_data_large_response(
+        resource,
+        session,
+        request,
+        response,
+        query,
+        42,
+        -1,
+        1,
+        expected.len(),
+        expected.as_ptr(),
+        None,
+        ptr::null_mut(),
+    ) != 1
+    {
+        coap_pdu_set_code(response, 160);
+    }
+}
+
 pub struct Client {
     context: *mut coap_context_t,
     session: *mut coap_session_t,
@@ -659,6 +776,14 @@ impl Client {
             && unsafe { coap_session_get_state(self.session) == coap_session_state_t_COAP_SESSION_STATE_ESTABLISHED }
     }
 
+    #[cfg(feature = "native-test-adapter")]
+    pub fn seed_request_tag_for_tests(&mut self, seed: u32) {
+        unsafe extern "C" {
+            fn coap_session_test_seed_request_tag(session: *mut coap_session_t, seed: u32);
+        }
+        unsafe { coap_session_test_seed_request_tag(self.session, seed) };
+    }
+
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
@@ -680,7 +805,7 @@ impl Client {
     ) -> Result<PreparedMessage<'_>, RequestError> {
         let capacity = self.capacity().ok_or("message layer not ready")?;
         unsafe {
-            let pdu = build_message(self.session, message, capacity, self.maximum_body, size, tag)?;
+            let pdu = build_message(self.session, message, capacity, self.maximum_body, size, tag, false)?;
             coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
             Ok(PreparedMessage {
                 pdu,
@@ -1093,6 +1218,7 @@ unsafe fn build_message(
     maximum_body: usize,
     size: RequestSize,
     tag: TagInsertion,
+    insert_echo: bool,
 ) -> Result<*mut coap_pdu_t, RequestError> {
     if message.token.is_empty()
         || message.token.len() > 8
@@ -1145,11 +1271,32 @@ unsafe fn build_message(
                 })
             },
         };
+        let echo = if insert_echo {
+            message
+                .options
+                .iter()
+                .find(|(number, _)| *number == COAP_OPTION_ECHO as u16)
+                .map(|(_, value)| value.as_slice())
+        } else {
+            None
+        };
+        let options;
+        let before_echo = if echo.is_some() {
+            options = message
+                .options
+                .iter()
+                .filter(|(number, _)| *number != COAP_OPTION_ECHO as u16)
+                .cloned()
+                .collect::<Vec<_>>();
+            options.as_slice()
+        } else {
+            message.options
+        };
         let pdu = build_request_pdu(
             message.confirmable,
             message.code,
             message.token,
-            message.options,
+            before_echo,
             allocation,
         )?;
         if matches!(tag, TagInsertion::Upload) {
@@ -1161,6 +1308,10 @@ unsafe fn build_message(
         }
         if !matches!(tag, TagInsertion::Template) {
             coap_session_runtime_tag(session, pdu, 0);
+        }
+        if echo.is_some_and(|echo| coap_pdu_insert_runtime_echo(pdu, echo.as_ptr(), echo.len()) != 1) {
+            coap_delete_pdu(pdu);
+            return Err("Echo option rejected".into());
         }
         Ok(pdu)
     }
@@ -1206,6 +1357,7 @@ unsafe extern "C" fn continuation(
             s.maximum_body,
             RequestSize::Transmit,
             TagInsertion::Template,
+            true,
         ) {
             Ok(pdu) => {
                 *withdraw = i32::from(next.withdraw_response_token);
