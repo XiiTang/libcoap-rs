@@ -64,13 +64,34 @@ pub enum ResponseAdmission {
     Acknowledge,
     Accept,
 }
+/// Native application write outcome before bytes enter supplied transport.
+pub enum ApplicationWrite {
+    Written(io::Result<usize>),
+    Withdrawn,
+}
 pub trait Callbacks {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<(usize, Option<SocketAddr>)>;
     fn write(&mut self, bytes: &[u8], peer: Option<SocketAddr>) -> io::Result<usize>;
+    fn preflight(&mut self, _token: &[u8], _destination: SocketAddr) -> bool {
+        true
+    }
+    fn write_application(
+        &mut self,
+        bytes: &[u8],
+        _token: &[u8],
+        destination: SocketAddr,
+        datagram: bool,
+    ) -> ApplicationWrite {
+        ApplicationWrite::Written(self.write(bytes, datagram.then_some(destination)))
+    }
     fn event(&mut self, event: Event) -> bool;
     fn admit_response(&mut self, _event: &Event, _protected: bool) -> ResponseAdmission {
         ResponseAdmission::Ignore
     }
+    fn continuation(&mut self, _capacity: Capacity) -> Option<Continuation> {
+        None
+    }
+    fn continuation_result(&mut self, _result: Result<i32, RequestError>) {}
     fn response(&mut self, event: Event) -> ResponseDecision {
         if self.event(event) {
             ResponseDecision::Accept
@@ -242,6 +263,7 @@ struct State {
     maximum_pdu: usize,
     maximum_options: usize,
     selected_response: Option<(*const coap_pdu_t, Event)>,
+    maximum_body: usize,
 }
 /// A controlled pre-release step could not completely hand off its notices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +284,7 @@ pub struct Capacity {
 
 /// One application-authored request. Only the first request in an operation
 /// can ask for native tag insertion.
+#[derive(Clone, Copy)]
 pub struct Message<'a> {
     pub peer: SocketAddr,
     pub token: &'a [u8],
@@ -269,6 +292,18 @@ pub struct Message<'a> {
     pub confirmable: bool,
     pub options: &'a [(u16, Vec<u8>)],
     pub payload: &'a [u8],
+}
+
+/// A single next attempt selected by the application response callback.
+pub struct Continuation {
+    pub peer: SocketAddr,
+    pub token: [u8; 8],
+    pub code: u8,
+    pub confirmable: bool,
+    pub options: Vec<(u16, Vec<u8>)>,
+    pub payload: Vec<u8>,
+    pub withdraw_response_token: bool,
+    pub acknowledge_first: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -299,8 +334,8 @@ impl PreparedMessage<'_> {
 
     pub fn send(mut self) -> Result<i32, RequestError> {
         unsafe {
-            coap_session_set_runtime_peer(self.session, CoapAddress::from(self.peer).as_raw_address());
             let pdu = std::mem::replace(&mut self.pdu, ptr::null_mut());
+            coap_pdu_set_runtime_destination(pdu, CoapAddress::from(self.peer).as_raw_address());
             let mid = coap_send(self.session, pdu);
             if mid < 0 {
                 return Err("request send failed".into());
@@ -426,6 +461,7 @@ impl Client {
                 maximum_pdu: limits.maximum_pdu,
                 maximum_options: limits.maximum_options,
                 selected_response: None,
+                maximum_body: limits.maximum_body,
             });
             let mut client = Self {
                 context,
@@ -446,6 +482,8 @@ impl Client {
                     return Err("controlled message layer unavailable");
                 }
                 coap_context_set_runtime_admit_response(context, Some(admit_response));
+                coap_context_set_runtime_application_output(context, Some(preflight), Some(write_application));
+                coap_context_set_runtime_continuation(context, Some(continuation), Some(continuation_result));
             } else {
                 coap_context_set_block_mode(context, COAP_BLOCK_USE_LIBCOAP);
             }
@@ -600,15 +638,7 @@ impl Client {
         if self.state.failed {
             return None;
         }
-        unsafe {
-            let mut capacity = std::mem::zeroed::<coap_runtime_capacity_t>();
-            (coap_session_runtime_capacity(self.session, &mut capacity) == 1).then_some(Capacity {
-                pdu_maximum: capacity.pdu_maximum,
-                message_maximum: capacity.message_maximum,
-                bert: capacity.bert != 0,
-                needs_first_response: capacity.needs_first_response != 0,
-            })
-        }
+        unsafe { read_capacity(self.session) }
     }
 
     /// Prepare a single PDU to a known responder. The multicast envelope uses
@@ -620,53 +650,8 @@ impl Client {
         tag: TagInsertion,
     ) -> Result<PreparedMessage<'_>, RequestError> {
         let capacity = self.capacity().ok_or("message layer not ready")?;
-        if message.token.is_empty()
-            || message.token.len() > 8
-            || !(1..=7).contains(&message.code)
-            || message.payload.len() > self.maximum_body
-            || message.options.windows(2).any(|pair| pair[0].0 > pair[1].0)
-        {
-            return Err("request limits exceeded".into());
-        }
         unsafe {
-            let fields = self.pdu(message.confirmable, message.code, message.token, message.options, 0)?;
-            let used = coap_pdu_runtime_used_size(fields);
-            coap_delete_pdu(fields);
-            let payload_size = message.payload.len() + usize::from(!message.payload.is_empty());
-            let bytes = used + payload_size;
-            let allocation = match size {
-                RequestSize::Transmit if bytes <= capacity.pdu_maximum => capacity.pdu_maximum,
-                RequestSize::Transmit => {
-                    return Err(RequestError::TooLarge {
-                        maximum: capacity.pdu_maximum,
-                        observed: None,
-                    })
-                },
-                RequestSize::Datagram { maximum } if bytes + 4 <= maximum => bytes,
-                RequestSize::Datagram { maximum } => {
-                    return Err(RequestError::TooLarge {
-                        maximum,
-                        observed: Some(bytes + 4),
-                    })
-                },
-            };
-            let pdu = self.pdu(
-                message.confirmable,
-                message.code,
-                message.token,
-                message.options,
-                allocation,
-            )?;
-            if matches!(tag, TagInsertion::Upload) {
-                coap_session_runtime_tag(self.session, pdu, 1);
-            }
-            if !message.payload.is_empty() && coap_add_data(pdu, message.payload.len(), message.payload.as_ptr()) != 1 {
-                coap_delete_pdu(pdu);
-                return Err("body rejected".into());
-            }
-            if !matches!(tag, TagInsertion::Template) {
-                coap_session_runtime_tag(self.session, pdu, 0);
-            }
+            let pdu = build_message(self.session, message, capacity, self.maximum_body, size, tag)?;
             coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
             Ok(PreparedMessage {
                 pdu,
@@ -675,6 +660,15 @@ impl Client {
                 _owner: PhantomData,
             })
         }
+    }
+
+    /// Retry the existing delayed queue after withdrawals or a room wake.
+    pub fn resume_output(&mut self) -> Result<(), &'static str> {
+        self.check()?;
+        if unsafe { coap_session_runtime_resume_output(self.session) } != 1 {
+            return Err("message layer output unavailable");
+        }
+        self.check()
     }
 
     pub fn check(&self) -> Result<(), &'static str> {
@@ -757,7 +751,7 @@ impl Client {
                     // receive maximum here would send any smaller body as one
                     // oversized message.
                     let maximum = self.transmit_pdu_maximum();
-                    let pdu = self.bounded(confirmable, code, token, options, maximum)?;
+                    let pdu = bounded(confirmable, code, token, options, maximum)?;
                     coap_pdu_set_mid(pdu, i32::from(coap_new_message_id(self.session)));
                     let body = Box::new(Zeroizing::new(payload));
                     let length = body.len();
@@ -790,7 +784,7 @@ impl Client {
                 // Plain data: libcoap starts no Block1 toward a group.
                 RequestSize::Datagram { maximum } => {
                     let payload = Zeroizing::new(payload);
-                    let probe = self.pdu(confirmable, code, token, options, 0)?;
+                    let probe = build_request_pdu(confirmable, code, token, options, 0)?;
                     let added = payload.is_empty() || coap_add_data(probe, payload.len(), payload.as_ptr()) == 1;
                     let used = coap_pdu_runtime_used_size(probe);
                     coap_delete_pdu(probe);
@@ -806,7 +800,7 @@ impl Client {
                         });
                     }
                     // Built at exactly its size, so libcoap adds nothing to it.
-                    let pdu = self.pdu(confirmable, code, token, options, used)?;
+                    let pdu = build_request_pdu(confirmable, code, token, options, used)?;
                     if !payload.is_empty() && coap_add_data(pdu, payload.len(), payload.as_ptr()) != 1 {
                         coap_delete_pdu(pdu);
                         return Err("body rejected".into());
@@ -823,71 +817,6 @@ impl Client {
                 Ok(mid)
             }
         }
-    }
-
-    /// A PDU of `size` holding `token` and `options`. libcoap refuses a token
-    /// or option the PDU cannot hold as it refuses an allocation, so a refused
-    /// build is measured without a bound: [`RequestError::TooLarge`] when it
-    /// is larger than `size`, the native refusal otherwise.
-    unsafe fn bounded(
-        &self,
-        confirmable: bool,
-        code: u8,
-        token: &[u8],
-        options: &[(u16, Vec<u8>)],
-        size: usize,
-    ) -> Result<*mut coap_pdu_t, RequestError> {
-        match self.pdu(confirmable, code, token, options, size) {
-            Ok(pdu) => Ok(pdu),
-            Err(refused) => {
-                let probe = self.pdu(confirmable, code, token, options, 0)?;
-                let used = coap_pdu_runtime_used_size(probe);
-                coap_delete_pdu(probe);
-                if used > size {
-                    Err(RequestError::TooLarge {
-                        maximum: size,
-                        observed: None,
-                    })
-                } else {
-                    Err(refused.into())
-                }
-            },
-        }
-    }
-
-    /// A PDU of `size` (0: no bound) holding `token` and `options`.
-    unsafe fn pdu(
-        &self,
-        confirmable: bool,
-        code: u8,
-        token: &[u8],
-        options: &[(u16, Vec<u8>)],
-        size: usize,
-    ) -> Result<*mut coap_pdu_t, &'static str> {
-        let pdu = coap_pdu_init(
-            if confirmable {
-                coap_pdu_type_t_COAP_MESSAGE_CON
-            } else {
-                coap_pdu_type_t_COAP_MESSAGE_NON
-            },
-            code.into(),
-            0,
-            size,
-        );
-        if pdu.is_null() {
-            return Err("request allocation failed");
-        }
-        if coap_add_token(pdu, token.len(), token.as_ptr()) != 1 {
-            coap_delete_pdu(pdu);
-            return Err("token rejected");
-        }
-        for (number, value) in options {
-            if coap_add_option(pdu, *number, value.len(), value.as_ptr()) == 0 {
-                coap_delete_pdu(pdu);
-                return Err("option rejected");
-            }
-        }
-        Ok(pdu)
     }
 
     /// Forget every listed request's native state in one call.
@@ -1021,6 +950,240 @@ unsafe extern "C" fn write(data: *mut c_void, buffer: *const u8, length: usize, 
         }
     })
 }
+unsafe extern "C" fn preflight(
+    data: *mut c_void,
+    token: *const coap_bin_const_t,
+    destination: *const coap_address_t,
+) -> std::ffi::c_int {
+    guarded(data, 0, |s| unsafe {
+        let token = std::slice::from_raw_parts((*token).s, (*token).length);
+        let destination = CoapAddress::from(&*destination)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        i32::from(s.callbacks.preflight(token, destination))
+    })
+}
+
+unsafe extern "C" fn write_application(
+    data: *mut c_void,
+    buffer: *const u8,
+    length: usize,
+    token: *const coap_bin_const_t,
+    destination: *const coap_address_t,
+    datagram: std::ffi::c_int,
+) -> isize {
+    guarded(data, -1, |s| unsafe {
+        let bytes = std::slice::from_raw_parts(buffer, length);
+        let token = std::slice::from_raw_parts((*token).s, (*token).length);
+        let destination = CoapAddress::from(&*destination)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        match s.callbacks.write_application(bytes, token, destination, datagram != 0) {
+            ApplicationWrite::Withdrawn => COAP_RUNTIME_WRITE_VETO as isize,
+            ApplicationWrite::Written(Ok(n)) if n <= length => n as isize,
+            ApplicationWrite::Written(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => 0,
+            _ => {
+                s.failed = true;
+                -1
+            },
+        }
+    })
+}
+
+/// A PDU of `size` holding `token` and `options`. libcoap refuses a token
+/// or option the PDU cannot hold as it refuses an allocation, so a refused
+/// build is measured without a bound: [`RequestError::TooLarge`] when it
+/// is larger than `size`, the native refusal otherwise.
+unsafe fn bounded(
+    confirmable: bool,
+    code: u8,
+    token: &[u8],
+    options: &[(u16, Vec<u8>)],
+    size: usize,
+) -> Result<*mut coap_pdu_t, RequestError> {
+    match build_request_pdu(confirmable, code, token, options, size) {
+        Ok(pdu) => Ok(pdu),
+        Err(refused) => {
+            let probe = build_request_pdu(confirmable, code, token, options, 0)?;
+            let used = coap_pdu_runtime_used_size(probe);
+            coap_delete_pdu(probe);
+            if used > size {
+                Err(RequestError::TooLarge {
+                    maximum: size,
+                    observed: None,
+                })
+            } else {
+                Err(refused.into())
+            }
+        },
+    }
+}
+
+/// A PDU of `size` (0: no bound) holding `token` and `options`.
+unsafe fn build_request_pdu(
+    confirmable: bool,
+    code: u8,
+    token: &[u8],
+    options: &[(u16, Vec<u8>)],
+    size: usize,
+) -> Result<*mut coap_pdu_t, &'static str> {
+    let pdu = coap_pdu_init(
+        if confirmable {
+            coap_pdu_type_t_COAP_MESSAGE_CON
+        } else {
+            coap_pdu_type_t_COAP_MESSAGE_NON
+        },
+        code.into(),
+        0,
+        size,
+    );
+    if pdu.is_null() {
+        return Err("request allocation failed");
+    }
+    if coap_add_token(pdu, token.len(), token.as_ptr()) != 1 {
+        coap_delete_pdu(pdu);
+        return Err("token rejected");
+    }
+    for (number, value) in options {
+        if coap_add_option(pdu, *number, value.len(), value.as_ptr()) == 0 {
+            coap_delete_pdu(pdu);
+            return Err("option rejected");
+        }
+    }
+    Ok(pdu)
+}
+
+unsafe fn build_message(
+    session: *mut coap_session_t,
+    message: Message<'_>,
+    capacity: Capacity,
+    maximum_body: usize,
+    size: RequestSize,
+    tag: TagInsertion,
+) -> Result<*mut coap_pdu_t, RequestError> {
+    if message.token.is_empty()
+        || message.token.len() > 8
+        || !(1..=7).contains(&message.code)
+        || message.payload.len() > maximum_body
+        || message.options.windows(2).any(|pair| pair[0].0 > pair[1].0)
+    {
+        return Err("request limits exceeded".into());
+    }
+    unsafe {
+        let fields = build_request_pdu(message.confirmable, message.code, message.token, message.options, 0)?;
+        let used = coap_pdu_runtime_used_size(fields);
+        coap_delete_pdu(fields);
+        let payload_size = message.payload.len() + usize::from(!message.payload.is_empty());
+        let bytes = used + payload_size;
+        let allocation = match size {
+            RequestSize::Transmit if bytes <= capacity.pdu_maximum => capacity.pdu_maximum,
+            RequestSize::Transmit => {
+                return Err(RequestError::TooLarge {
+                    maximum: capacity.pdu_maximum,
+                    observed: None,
+                })
+            },
+            RequestSize::Datagram { maximum } if bytes + 4 <= maximum => bytes,
+            RequestSize::Datagram { maximum } => {
+                return Err(RequestError::TooLarge {
+                    maximum,
+                    observed: Some(bytes + 4),
+                })
+            },
+        };
+        let pdu = build_request_pdu(
+            message.confirmable,
+            message.code,
+            message.token,
+            message.options,
+            allocation,
+        )?;
+        if matches!(tag, TagInsertion::Upload) {
+            coap_session_runtime_tag(session, pdu, 1);
+        }
+        if !message.payload.is_empty() && coap_add_data(pdu, message.payload.len(), message.payload.as_ptr()) != 1 {
+            coap_delete_pdu(pdu);
+            return Err("body rejected".into());
+        }
+        if !matches!(tag, TagInsertion::Template) {
+            coap_session_runtime_tag(session, pdu, 0);
+        }
+        Ok(pdu)
+    }
+}
+
+unsafe fn read_capacity(session: *mut coap_session_t) -> Option<Capacity> {
+    let mut capacity = std::mem::zeroed::<coap_runtime_capacity_t>();
+    (coap_session_runtime_capacity(session, &mut capacity) == 1).then_some(Capacity {
+        pdu_maximum: capacity.pdu_maximum,
+        message_maximum: capacity.message_maximum,
+        bert: capacity.bert != 0,
+        needs_first_response: capacity.needs_first_response != 0,
+    })
+}
+
+unsafe extern "C" fn continuation(
+    session: *mut coap_session_t,
+    _response: *const coap_pdu_t,
+    withdraw: *mut std::ffi::c_int,
+    ack_first: *mut std::ffi::c_int,
+) -> *mut coap_pdu_t {
+    guarded(data(session), ptr::null_mut(), |s| unsafe {
+        let Some(capacity) = read_capacity(session) else {
+            return ptr::null_mut();
+        };
+        let Some(next) = s.callbacks.continuation(capacity) else {
+            return ptr::null_mut();
+        };
+        let message = Message {
+            peer: next.peer,
+            token: &next.token,
+            code: next.code,
+            confirmable: next.confirmable,
+            options: &next.options,
+            payload: &next.payload,
+        };
+        match build_message(
+            session,
+            message,
+            capacity,
+            s.maximum_body,
+            RequestSize::Transmit,
+            TagInsertion::Template,
+        ) {
+            Ok(pdu) => {
+                *withdraw = i32::from(next.withdraw_response_token);
+                *ack_first = i32::from(next.acknowledge_first);
+                coap_pdu_set_runtime_destination(pdu, CoapAddress::from(next.peer).as_raw_address());
+                pdu
+            },
+            Err(error) => {
+                s.callbacks.continuation_result(Err(error));
+                ptr::null_mut()
+            },
+        }
+    })
+}
+
+unsafe extern "C" fn continuation_result(
+    session: *mut coap_session_t,
+    _response: *const coap_pdu_t,
+    result: coap_mid_t,
+) {
+    guarded(data(session), (), |s| {
+        let result = if result < 0 {
+            Err("request send failed".into())
+        } else {
+            Ok(result)
+        };
+        s.callbacks.continuation_result(result);
+    })
+}
+
 unsafe fn data(session: *mut coap_session_t) -> *mut c_void {
     coap_get_app_data(coap_session_get_context(session))
 }
@@ -2764,7 +2927,7 @@ mod controlled_io_tests {
     /// native state behind.
     fn native_adds(client: &Client, envelope: usize, prefix: Option<u16>, body: &[u8]) -> bool {
         unsafe {
-            let Ok(pdu) = client.pdu(
+            let Ok(pdu) = build_request_pdu(
                 true,
                 3,
                 &[7; 8],

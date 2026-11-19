@@ -620,3 +620,14 @@ The Boundless regression `supplied_message_layer_dispatches_only_an_admitted_blo
 drives a wrong-MID and a genuine piggybacked Block2 response through the
 public binding, checking CON credit, the admitted bytes and the lack of a
 native fetch.
+
+## Supplied message-layer writes and inline continuations
+
+An opted-in caller rechecks the full application token and destination at
+the supplied write. It can refuse that attempt without reporting transport
+failure or output room. The existing queue can be resumed after exact forget.
+The response callback can select one prepared continuation for the native
+dispatcher to submit before the next frame and report the result. The
+Boundless regression `supplied_message_layer_dispatches_only_an_admitted_block_head`
+checks that the vetoed delayed CON contributes no bytes and leaves credit
+for its live sibling after retirement.
