@@ -680,3 +680,10 @@ disposition for the short Block2 head that the pin presents as 4.02.
 Boundless's CoAP transfer-pipeline witnesses cover both initial UDP limits,
 oversized multicast fetch, protected TCP, a raw CSM no-fit and the short
 head at loopback peers.
+
+## DTLS opening exhaustion event
+
+Pin the libcoap change that publishes proven OpenSSL handshake exhaustion.
+The Controlled event callback carries the native code before teardown.
+Boundless attaches the attempted peer and selects the opening failure in its
+original owner. Normal release and peer close events keep their current codes.
