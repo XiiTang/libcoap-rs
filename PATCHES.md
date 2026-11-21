@@ -683,7 +683,13 @@ head at loopback peers.
 
 ## DTLS opening exhaustion event
 
-Pin the libcoap change that publishes proven OpenSSL handshake exhaustion.
-The Controlled event callback carries the native code before teardown.
-Boundless attaches the attempted peer and selects the opening failure in its
-original owner. Normal release and peer close events keep their current codes.
+[Upstream `0dbf5d33`](https://github.com/namib-project/libcoap-rs/blob/0dbf5d33/libcoap/src/event.rs#L30)
+dispatches the existing DTLS Closed and Error events through its event handler.
+The Controlled callback is part of this fork and already forwards native event
+numbers before teardown. The gitlink adds the
+[libcoap DTLS opening exhaustion event](https://github.com/XiiTang/libcoap/blob/1a89e86b/PATCHES.md#openssl-dtls-opening-exhaustion).
+Boundless attaches the attempted peer and selects the failure in the opening
+owner. Normal release and peer close events keep their current codes.
+
+Boundless regression: [`independent_dtls_psk_and_wrong_key_rejected`](https://github.com/XiiTang/Boundless/blob/580d92fe/src/protocols/coap/tests.rs#L665)
+drives a standalone TinyDTLS peer with correct and incorrect keys.
