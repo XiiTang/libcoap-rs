@@ -691,5 +691,7 @@ numbers before teardown. The gitlink adds the
 Boundless attaches the attempted peer and selects the failure in the opening
 owner. Normal release and peer close events keep their current codes.
 
-Boundless regression: [`independent_dtls_psk_and_wrong_key_rejected`](https://github.com/XiiTang/Boundless/blob/580d92fe/src/protocols/coap/tests.rs#L665)
-drives a standalone TinyDTLS peer with correct and incorrect keys.
+The Boundless regression `independent_dtls_psk_and_wrong_key_rejected` in
+`src/protocols/coap/tests.rs` opens against a standalone TinyDTLS peer. For the
+wrong key it asserts `connect_failed`, reason `timed_out`, and the attempted
+peer address. It passed in `rt-batch-j-coap-and-help-94869-1795220591`.
